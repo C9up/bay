@@ -4,31 +4,36 @@
 	"description": "Queue — pluggable job-queue contract with memory + Redis drivers for the Ream framework",
 	"license": "MIT",
 	"type": "module",
-	"main": "src/index.ts",
-	"types": "src/index.ts",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
 	"exports": {
 		".": {
-			"import": "./src/index.ts",
-			"types": "./src/index.ts"
+			"types": "./dist/index.d.ts",
+			"development": "./src/index.ts",
+			"import": "./dist/index.js"
 		},
 		"./provider": {
-			"import": "./src/BayProvider.ts",
-			"types": "./src/BayProvider.ts"
+			"types": "./dist/BayProvider.d.ts",
+			"development": "./src/BayProvider.ts",
+			"import": "./dist/BayProvider.js"
 		},
 		"./services/main": {
-			"import": "./src/services/main.ts",
-			"types": "./src/services/main.ts"
+			"types": "./dist/services/main.d.ts",
+			"development": "./src/services/main.ts",
+			"import": "./dist/services/main.js"
 		},
 		"./testing": {
-			"import": "./src/testing/FakeQueue.ts",
-			"types": "./src/testing/FakeQueue.ts"
+			"types": "./dist/testing/FakeQueue.d.ts",
+			"development": "./src/testing/FakeQueue.ts",
+			"import": "./dist/testing/FakeQueue.js"
 		}
 	},
 	"scripts": {
-		"build": "tsc",
+		"build": "tsc -p tsconfig.build.json",
 		"test": "vitest run",
 		"lint": "biome check src/",
-		"test:coverage": "vitest run --coverage"
+		"test:coverage": "vitest run --coverage",
+		"typecheck": "tsc --noEmit"
 	},
 	"peerDependencies": {
 		"@c9up/ream": "workspace:*"
@@ -40,5 +45,11 @@
 	},
 	"engines": {
 		"node": ">=22.0.0"
-	}
+	},
+	"files": [
+		"src",
+		"dist",
+		"README.md",
+		"LICENSE"
+	]
 }
