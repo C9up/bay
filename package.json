@@ -1,0 +1,44 @@
+{
+	"name": "@c9up/bay",
+	"version": "0.1.0",
+	"description": "Queue — pluggable job-queue contract with memory + Redis drivers for the Ream framework",
+	"license": "MIT",
+	"type": "module",
+	"main": "src/index.ts",
+	"types": "src/index.ts",
+	"exports": {
+		".": {
+			"import": "./src/index.ts",
+			"types": "./src/index.ts"
+		},
+		"./provider": {
+			"import": "./src/BayProvider.ts",
+			"types": "./src/BayProvider.ts"
+		},
+		"./services/main": {
+			"import": "./src/services/main.ts",
+			"types": "./src/services/main.ts"
+		},
+		"./testing": {
+			"import": "./src/testing/FakeQueue.ts",
+			"types": "./src/testing/FakeQueue.ts"
+		}
+	},
+	"scripts": {
+		"build": "tsc",
+		"test": "vitest run",
+		"lint": "biome check src/",
+		"test:coverage": "vitest run --coverage"
+	},
+	"peerDependencies": {
+		"@c9up/ream": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/node": "^22.19.15",
+		"typescript": "^6.0.2",
+		"vitest": "^4.1.2"
+	},
+	"engines": {
+		"node": ">=22.0.0"
+	}
+}
