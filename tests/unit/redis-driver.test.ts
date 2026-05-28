@@ -217,7 +217,9 @@ describe("bay > RedisDriver > recoverStale", () => {
 		expect(recovered).toBe(1);
 		// j1 should be back in pending; j2 still in processing.
 		expect(fake.lists.get("queue:pending")?.length).toBe(1);
-		expect(JSON.parse(defined(defined(fake.lists.get("queue:pending"))[0])).id).toBe("j1");
+		expect(
+			JSON.parse(defined(defined(fake.lists.get("queue:pending"))[0])).id,
+		).toBe("j1");
 		expect(fake.lists.get("queue:processing")?.length).toBe(1);
 	});
 
