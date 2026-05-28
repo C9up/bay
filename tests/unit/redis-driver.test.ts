@@ -5,6 +5,12 @@ import {
 } from "../../src/drivers/RedisDriver.js";
 import type { Job } from "../../src/QueueManager.js";
 
+/** Narrow away null/undefined without a `!` non-null assertion (which lies to the compiler). */
+function defined<T>(value: T | null | undefined): T {
+	if (value == null) throw new Error("expected a defined value");
+	return value;
+}
+
 function createFakeRedis(opts?: { withLmove?: boolean }): {
 	client: RedisClient;
 	lists: Map<string, string[]>;
@@ -95,7 +101,7 @@ describe("bay > RedisDriver > push/pop", () => {
 		await driver.push(makeJob());
 		const pending = fake.lists.get("queue:pending") ?? [];
 		expect(pending).toHaveLength(1);
-		expect(JSON.parse(pending[0]!).id).toBe("job_x");
+		expect(JSON.parse(defined(pending[0])).id).toBe("job_x");
 	});
 
 	it("pop with LMOVE moves the job from pending → processing atomically", async () => {
@@ -173,7 +179,7 @@ describe("bay > RedisDriver > complete/fail/retry", () => {
 		expect(fake.lists.get("queue:processing")?.length).toBe(0);
 		const failedRaw = fake.lists.get("queue:failed")?.[0];
 		expect(failedRaw).toBeDefined();
-		const failed = JSON.parse(failedRaw!);
+		const failed = JSON.parse(defined(failedRaw));
 		expect(failed.error).toBe("transient failure");
 		expect(failed.status).toBe("failed");
 	});
@@ -189,7 +195,7 @@ describe("bay > RedisDriver > complete/fail/retry", () => {
 		expect(fake.lists.get("queue:processing")?.length).toBe(0);
 		const pending = fake.lists.get("queue:pending");
 		expect(pending?.length).toBe(1);
-		expect(JSON.parse(pending![0]!).status).toBe("pending");
+		expect(JSON.parse(defined(defined(pending)[0])).status).toBe("pending");
 	});
 });
 
@@ -211,7 +217,7 @@ describe("bay > RedisDriver > recoverStale", () => {
 		expect(recovered).toBe(1);
 		// j1 should be back in pending; j2 still in processing.
 		expect(fake.lists.get("queue:pending")?.length).toBe(1);
-		expect(JSON.parse(fake.lists.get("queue:pending")![0]!).id).toBe("j1");
+		expect(JSON.parse(defined(defined(fake.lists.get("queue:pending"))[0])).id).toBe("j1");
 		expect(fake.lists.get("queue:processing")?.length).toBe(1);
 	});
 

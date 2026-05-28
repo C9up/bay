@@ -6,6 +6,12 @@ import {
 	QueueManager,
 } from "../../src/QueueManager.js";
 
+/** Narrow away null/undefined without a `!` non-null assertion (which lies to the compiler). */
+function defined<T>(value: T | null | undefined): T {
+	if (value == null) throw new Error("expected a defined value");
+	return value;
+}
+
 class CapturingDriver implements QueueDriver {
 	pending: Job[] = [];
 	completed: Job[] = [];
@@ -45,7 +51,7 @@ describe("bay > QueueManager > dispatch", () => {
 		const id = await q.dispatch("send-email", { to: "x@y" });
 		expect(id).toMatch(/^job_/);
 		expect(driver.pending).toHaveLength(1);
-		const job = driver.pending[0]!;
+		const job = defined(driver.pending[0]);
 		expect(job.name).toBe("send-email");
 		expect(job.payload).toEqual({ to: "x@y" });
 		expect(job.maxAttempts).toBe(3);
