@@ -4,7 +4,7 @@
  *
  * Populated by either:
  *   - `BayProvider.boot()`, when the app uses `() => import('@c9up/bay/provider')`
- *   - The app itself, via `_setQueue(myQueue)`, when it wires a
+ *   - The app itself, via `setQueue(myQueue)`, when it wires a
  *     custom-driver `QueueManager` outside the provider flow.
  *
  *   import queue from '@c9up/bay/services/main'
@@ -15,28 +15,28 @@
 
 import type { QueueManager } from "../QueueManager.js";
 
-let _instance: QueueManager | undefined;
+let instance: QueueManager | undefined;
 
 /** @internal Bind the singleton (called by BayProvider or by the app). */
-export function _setQueue(instance: QueueManager): void {
-	_instance = instance;
+export function setQueue(value: QueueManager): void {
+	instance = value;
 }
 
 /** @internal Read the singleton (or `undefined` pre-boot). */
-export function _getQueue(): QueueManager | undefined {
-	return _instance;
+export function getQueue(): QueueManager | undefined {
+	return instance;
 }
 
 const queue: QueueManager = new Proxy({} as QueueManager, {
 	get(_target, prop) {
-		if (!_instance) {
+		if (!instance) {
 			throw new Error(
 				"[bay] QueueManager singleton accessed before BayProvider.boot() ran " +
-					"or `_setQueue(myQueue)` was called. Wire one of them first.",
+					"or `setQueue(myQueue)` was called. Wire one of them first.",
 			);
 		}
-		const value = Reflect.get(_instance, prop, _instance);
-		return typeof value === "function" ? value.bind(_instance) : value;
+		const value = Reflect.get(instance, prop, instance);
+		return typeof value === "function" ? value.bind(instance) : value;
 	},
 });
 

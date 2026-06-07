@@ -1,6 +1,6 @@
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
 import { QueueManager } from "./QueueManager.js";
-import { _setQueue } from "./services/main.js";
+import { setQueue } from "./services/main.js";
 
 /**
  * Slim, duck-typed host context — bay stays publishable without
@@ -26,7 +26,7 @@ export interface BayProviderConfig {
 	 * `"redis"`. For any other case (custom driver, pre-built
 	 * instance), wire `QueueManager` directly in your app's startup
 	 * and skip the provider — the `services/main` singleton accepts
-	 * `_setQueue(myQueue)` from outside.
+	 * `setQueue(myQueue)` from outside.
 	 *
 	 * Default `"memory"`.
 	 */
@@ -78,7 +78,7 @@ export default class BayProvider {
 	async boot(): Promise<void> {
 		// Populate the `@c9up/bay/services/main` singleton so apps can
 		// `import queue from '@c9up/bay/services/main'` from anywhere.
-		_setQueue(this.app.container.resolve<QueueManager>(QueueManager));
+		setQueue(this.app.container.resolve<QueueManager>(QueueManager));
 	}
 
 	async shutdown(): Promise<void> {}
