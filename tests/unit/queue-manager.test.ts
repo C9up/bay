@@ -265,3 +265,41 @@ describe("bay > QueueManager > drain / passthrough getters", () => {
 		expect(await q.failedJobs()).toHaveLength(1);
 	});
 });
+
+// Audit 2026-06-13: recoverStale() was implemented on RedisDriver but never in
+// the QueueDriver contract nor called by work() — crashed-worker jobs sat in
+// 'processing' forever. These pin the wiring.
+describe("bay > QueueManager > recoverStale", () => {
+	class RecoveringDriver extends CapturingDriver {
+		recoverCalls = 0;
+		async recoverStale(): Promise<number> {
+			this.recoverCalls++;
+			return 2;
+		}
+	}
+
+	it("delegates recoverStale() to the driver and returns its count", async () => {
+		const driver = new RecoveringDriver();
+		const q = new QueueManager(driver);
+		expect(await q.recoverStale()).toBe(2);
+		expect(driver.recoverCalls).toBe(1);
+	});
+
+	it("returns 0 when the driver has no recoverStale (in-memory)", async () => {
+		const q = new QueueManager(new CapturingDriver());
+		expect(await q.recoverStale()).toBe(0);
+	});
+
+	it("work() reclaims orphaned jobs at startup", async () => {
+		const driver = new RecoveringDriver();
+		const q = new QueueManager(driver);
+		// Huge recover interval → only the startup recovery fires before we stop.
+		const run = q.work(5, 1_000_000);
+		await vi.waitFor(() =>
+			expect(driver.recoverCalls).toBeGreaterThanOrEqual(1),
+		);
+		await q.stop();
+		await run;
+		expect(driver.recoverCalls).toBe(1);
+	});
+});

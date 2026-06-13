@@ -31,6 +31,12 @@ export interface QueueDriver {
 	retry(job: Job): Promise<void>;
 	failed(): Promise<Job[]>;
 	size(): Promise<number>;
+	/**
+	 * Optional crash recovery: move jobs orphaned in the driver's 'processing'
+	 * state (expired visibility lease) back to pending, returning the count
+	 * recovered. In-memory drivers omit this — their jobs don't survive a crash.
+	 */
+	recoverStale?(): Promise<number>;
 }
 
 export class QueueManager {
@@ -113,15 +119,25 @@ export class QueueManager {
 		return true;
 	}
 
-	/** Start processing jobs continuously. */
-	async work(pollIntervalMs = 1000): Promise<void> {
+	/**
+	 * Start processing jobs continuously. Reclaims crash-orphaned jobs at
+	 * startup and every `recoverStaleMs` thereafter (no-op for in-memory drivers
+	 * without recoverStale) — otherwise a job left in 'processing' by a crashed
+	 * worker would sit there forever.
+	 */
+	async work(pollIntervalMs = 1000, recoverStaleMs = 30_000): Promise<void> {
 		if (pollIntervalMs <= 0) {
 			throw new Error("pollIntervalMs must be positive");
+		}
+		if (recoverStaleMs <= 0) {
+			throw new Error("recoverStaleMs must be positive");
 		}
 		if (this.running) {
 			throw new Error("QueueManager is already running");
 		}
 		this.running = true;
+		await this.#tryRecoverStale();
+		let lastRecover = Date.now();
 		while (this.running) {
 			try {
 				this.inflightPromise = this.processOne();
@@ -137,7 +153,32 @@ export class QueueManager {
 			} finally {
 				this.inflightPromise = null;
 			}
+			if (this.running && Date.now() - lastRecover >= recoverStaleMs) {
+				await this.#tryRecoverStale();
+				lastRecover = Date.now();
+			}
 		}
+	}
+
+	/** recoverStale() wrapper that swallows driver errors — used by the work loop. */
+	async #tryRecoverStale(): Promise<void> {
+		try {
+			await this.recoverStale();
+		} catch (err) {
+			process.stderr.write(
+				`QueueManager recoverStale error: ${err instanceof Error ? err.message : String(err)}\n`,
+			);
+		}
+	}
+
+	/**
+	 * Reclaim jobs orphaned by a crashed worker — moves entries stuck in the
+	 * driver's 'processing' state (expired lease) back to pending and returns
+	 * the count recovered. Returns 0 for in-memory drivers without recovery.
+	 * Called automatically by work(); also safe to schedule manually.
+	 */
+	async recoverStale(): Promise<number> {
+		return (await this.driver.recoverStale?.()) ?? 0;
 	}
 
 	/** Await the currently in-flight processOne, if any. */
