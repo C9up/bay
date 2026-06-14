@@ -116,11 +116,15 @@ describe("bay > RedisDriver > push/pop", () => {
 
 	it("pop falls back to LPOP+RPUSH when LMOVE is unavailable", async () => {
 		const fake = createFakeRedis({ withLmove: false });
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		const driver = new RedisDriver(fake.client);
+		// The at-most-once downgrade must be surfaced, not silent (audit 2026-06-13).
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining("at-most-once"));
 		await driver.push(makeJob({ id: "j1" }));
 		const popped = await driver.pop();
 		expect(popped?.id).toBe("j1");
 		expect(fake.lists.get("queue:processing")?.length).toBe(1);
+		warn.mockRestore();
 	});
 
 	it("pop sets a lease key with PX visibilityTimeout", async () => {

@@ -7,7 +7,15 @@
  * - If a worker crashes, the job stays in processing
  * - recoverStale() moves expired processing jobs back to pending
  *
- * Compatible with ioredis and node-redis clients.
+ * Without LMOVE (Redis <6.2) pop() falls back to a non-atomic lpop+rpush, which
+ * downgrades delivery to at-most-once — a crash between the two commands drops
+ * the in-flight job (recoverStale can't reclaim it, it was never in processing).
+ * The constructor warns when the client lacks LMOVE so the downgrade isn't silent.
+ *
+ * The client must be ioredis-shaped: lowercase methods and positional options
+ * (e.g. set(key, val, "PX", ms)). node-redis v4 (camelCase + options objects like
+ * { PX: ms }) does NOT satisfy this interface and would drop the lease TTL — it
+ * needs a thin adapter.
  */
 
 import type { Job, QueueDriver } from "../QueueManager.js";
@@ -53,6 +61,13 @@ export class RedisDriver implements QueueDriver {
 		this.#client = client;
 		this.#prefix = options?.prefix ?? "queue:";
 		this.#visibilityTimeout = options?.visibilityTimeoutMs ?? 30_000;
+		if (typeof client.lmove !== "function") {
+			console.warn(
+				"[bay] RedisDriver: client lacks LMOVE (Redis <6.2). pop() falls back to " +
+					"a non-atomic lpop+rpush, downgrading delivery from at-least-once to " +
+					"at-most-once — a crash between the two commands loses the in-flight job.",
+			);
+		}
 	}
 
 	#pendingKey = () => `${this.#prefix}pending`;

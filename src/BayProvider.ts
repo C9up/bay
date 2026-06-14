@@ -22,15 +22,16 @@ export interface BayAppContext {
 
 export interface BayProviderConfig {
 	/**
-	 * Driver to bind by default. Recognized strings: `"memory"`,
-	 * `"redis"`. For any other case (custom driver, pre-built
-	 * instance), wire `QueueManager` directly in your app's startup
-	 * and skip the provider — the `services/main` singleton accepts
-	 * `setQueue(myQueue)` from outside.
+	 * Driver to bind by default. The provider only auto-wires `"memory"`
+	 * (the default) — it has no Redis connection to build a `RedisDriver`
+	 * from. For Redis, a custom driver, or a pre-built instance, wire
+	 * `QueueManager` directly in your app's startup and skip the provider;
+	 * the `services/main` singleton resolves whatever is registered.
+	 * Passing anything other than `"memory"` throws at boot.
 	 *
 	 * Default `"memory"`.
 	 */
-	driver?: "memory" | "redis";
+	driver?: "memory";
 }
 
 /**
