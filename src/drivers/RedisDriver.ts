@@ -60,7 +60,17 @@ export class RedisDriver implements QueueDriver {
 	) {
 		this.#client = client;
 		this.#prefix = options?.prefix ?? "queue:";
-		this.#visibilityTimeout = options?.visibilityTimeoutMs ?? 30_000;
+		const visibilityTimeout = options?.visibilityTimeoutMs ?? 30_000;
+		// A non-positive / non-integer timeout makes pop()'s `SET … PX <ms>` fail
+		// on a real Redis; the catch then removes the job from `processing` and
+		// returns null — the in-flight job is silently LOST. Fail closed at config
+		// time instead.
+		if (!Number.isInteger(visibilityTimeout) || visibilityTimeout <= 0) {
+			throw new Error(
+				`[bay] RedisDriver visibilityTimeoutMs must be a positive integer (ms), got ${visibilityTimeout}`,
+			);
+		}
+		this.#visibilityTimeout = visibilityTimeout;
 		if (typeof client.lmove !== "function") {
 			console.warn(
 				"[bay] RedisDriver: client lacks LMOVE (Redis <6.2). pop() falls back to " +

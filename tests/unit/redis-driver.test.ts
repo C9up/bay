@@ -94,6 +94,22 @@ function makeJob(over: Partial<Job> = {}): Job {
 	};
 }
 
+describe("bay > RedisDriver > config validation", () => {
+	it("rejects a non-positive / non-integer visibilityTimeoutMs (else pop() loses jobs)", () => {
+		const fake = createFakeRedis();
+		for (const bad of [0, -1, 1.5, Number.NaN]) {
+			expect(
+				() => new RedisDriver(fake.client, { visibilityTimeoutMs: bad }),
+			).toThrow(/visibilityTimeoutMs must be a positive integer/);
+		}
+		// A valid positive integer — and the default — construct fine.
+		expect(
+			() => new RedisDriver(fake.client, { visibilityTimeoutMs: 5000 }),
+		).not.toThrow();
+		expect(() => new RedisDriver(fake.client)).not.toThrow();
+	});
+});
+
 describe("bay > RedisDriver > push/pop", () => {
 	it("push enqueues a serialized job onto the pending list", async () => {
 		const fake = createFakeRedis();
