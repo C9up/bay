@@ -10,7 +10,7 @@ import { setQueue } from "./services/main.js";
  */
 interface BayContainer {
 	singleton(token: unknown, factory: () => unknown): void;
-	resolve<T = unknown>(token: unknown): T;
+	resolve<T = unknown>(token: unknown): Promise<T>;
 }
 interface BayConfigStore {
 	get<T = unknown>(key: string): T | undefined;
@@ -79,7 +79,7 @@ export default class BayProvider {
 	async boot(): Promise<void> {
 		// Populate the `@c9up/bay/services/main` singleton so apps can
 		// `import queue from '@c9up/bay/services/main'` from anywhere.
-		setQueue(this.app.container.resolve<QueueManager>(QueueManager));
+		setQueue(await this.app.container.resolve<QueueManager>(QueueManager));
 	}
 
 	async shutdown(): Promise<void> {}
