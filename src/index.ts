@@ -22,3 +22,4 @@ import type { BayProviderConfig } from "./BayProvider.js";
 export function defineConfig<T extends BayProviderConfig>(config: T): T {
 	return config;
 }
+export { quasarConnection } from "./quasar.js";

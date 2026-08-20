@@ -49,16 +49,71 @@ function isValidJob(obj: unknown): obj is Job {
 	);
 }
 
+/**
+ * Where the client comes from. A resolver is what lets a queue name its
+ * connection (`quasarConnection("jobs")`) instead of being handed a client:
+ * the driver is built synchronously, the first command that needs the client
+ * is not.
+ */
+export type RedisClientSource =
+	| RedisClient
+	| (() => RedisClient | Promise<RedisClient>);
+
+/**
+ * LMOVE (Redis 6.2+) is what makes pop() atomic. Warned once, when the client
+ * is resolved rather than at construction — a driver that names its connection
+ * has no client to inspect yet.
+ */
+const warned = new WeakSet<object>();
+function warnWithoutLmove(client: RedisClient): void {
+	if (typeof client.lmove === "function" || warned.has(client)) return;
+	warned.add(client);
+	console.warn(
+		"[bay] RedisDriver: client lacks LMOVE (Redis <6.2). pop() falls back to " +
+			"a non-atomic lpop+rpush, downgrading delivery from at-least-once to " +
+			"at-most-once — a crash between the two commands loses the in-flight job.",
+	);
+}
+
 export class RedisDriver implements QueueDriver {
-	#client: RedisClient;
+	#source: RedisClientSource;
+	#resolved: RedisClient | undefined;
+	#pending: Promise<RedisClient> | undefined;
 	#prefix: string;
 	#visibilityTimeout: number;
 
+	/**
+	 * The client, resolved once. Two workers racing on a cold queue must not
+	 * each open their own connection, so the in-flight promise is shared.
+	 */
+	async #client(): Promise<RedisClient> {
+		if (this.#resolved) return this.#resolved;
+		if (typeof this.#source !== "function") {
+			this.#resolved = this.#source;
+			warnWithoutLmove(this.#resolved);
+			return this.#resolved;
+		}
+		if (!this.#pending) {
+			const resolver = this.#source;
+			this.#pending = Promise.resolve(resolver()).then((client) => {
+				this.#resolved = client;
+				this.#pending = undefined;
+				warnWithoutLmove(client);
+				return client;
+			});
+		}
+		return this.#pending;
+	}
+
 	constructor(
-		client: RedisClient,
+		source: RedisClientSource,
 		options?: { prefix?: string; visibilityTimeoutMs?: number },
 	) {
-		this.#client = client;
+		this.#source = source;
+		// A client handed in directly can be checked now, so the warning keeps
+		// landing at construction as it always did. A named connection has no
+		// client yet — it is checked when the connection resolves.
+		if (typeof source !== "function") warnWithoutLmove(source);
 		this.#prefix = options?.prefix ?? "queue:";
 		const visibilityTimeout = options?.visibilityTimeoutMs ?? 30_000;
 		// A non-positive / non-integer timeout makes pop()'s `SET … PX <ms>` fail
@@ -71,13 +126,6 @@ export class RedisDriver implements QueueDriver {
 			);
 		}
 		this.#visibilityTimeout = visibilityTimeout;
-		if (typeof client.lmove !== "function") {
-			console.warn(
-				"[bay] RedisDriver: client lacks LMOVE (Redis <6.2). pop() falls back to " +
-					"a non-atomic lpop+rpush, downgrading delivery from at-least-once to " +
-					"at-most-once — a crash between the two commands loses the in-flight job.",
-			);
-		}
 	}
 
 	#pendingKey = () => `${this.#prefix}pending`;
@@ -86,22 +134,24 @@ export class RedisDriver implements QueueDriver {
 	#leaseKey = (jobId: string) => `${this.#prefix}lease:${jobId}`;
 
 	async push(job: Job): Promise<void> {
-		await this.#client.rpush(this.#pendingKey(), JSON.stringify(job));
+		const client = await this.#client();
+		await client.rpush(this.#pendingKey(), JSON.stringify(job));
 	}
 
 	async pop(): Promise<Job | null> {
+		const client = await this.#client();
 		let raw: string | null = null;
 
-		if (this.#client.lmove) {
-			raw = await this.#client.lmove(
+		if (client.lmove) {
+			raw = await client.lmove(
 				this.#pendingKey(),
 				this.#processingKey(),
 				"LEFT",
 				"RIGHT",
 			);
 		} else {
-			raw = await this.#client.lpop(this.#pendingKey());
-			if (raw) await this.#client.rpush(this.#processingKey(), raw);
+			raw = await client.lpop(this.#pendingKey());
+			if (raw) await client.rpush(this.#processingKey(), raw);
 		}
 
 		if (!raw) return null;
@@ -111,10 +161,10 @@ export class RedisDriver implements QueueDriver {
 				// Malformed payload — purge from `processing` so it can't sit
 				// there indefinitely as a poison pill. recoverStale() also
 				// catches survivors but pop()'s own move is the primary path.
-				await this.#client.lrem(this.#processingKey(), 1, raw);
+				await client.lrem(this.#processingKey(), 1, raw);
 				return null;
 			}
-			await this.#client.set(
+			await client.set(
 				this.#leaseKey(parsed.id),
 				raw,
 				"PX",
@@ -122,33 +172,37 @@ export class RedisDriver implements QueueDriver {
 			);
 			return parsed;
 		} catch {
-			await this.#client.lrem(this.#processingKey(), 1, raw);
+			await client.lrem(this.#processingKey(), 1, raw);
 			return null;
 		}
 	}
 
 	async complete(job: Job): Promise<void> {
+		const client = await this.#client();
 		await this.#removeFromProcessing(job);
-		await this.#client.del(this.#leaseKey(job.id));
+		await client.del(this.#leaseKey(job.id));
 	}
 
 	async fail(job: Job, error: string): Promise<void> {
+		const client = await this.#client();
 		await this.#removeFromProcessing(job);
-		await this.#client.del(this.#leaseKey(job.id));
+		await client.del(this.#leaseKey(job.id));
 		job.error = error;
 		job.status = "failed";
-		await this.#client.rpush(this.#failedKey(), JSON.stringify(job));
+		await client.rpush(this.#failedKey(), JSON.stringify(job));
 	}
 
 	async retry(job: Job): Promise<void> {
+		const client = await this.#client();
 		await this.#removeFromProcessing(job);
-		await this.#client.del(this.#leaseKey(job.id));
+		await client.del(this.#leaseKey(job.id));
 		job.status = "pending";
-		await this.#client.rpush(this.#pendingKey(), JSON.stringify(job));
+		await client.rpush(this.#pendingKey(), JSON.stringify(job));
 	}
 
 	async recoverStale(): Promise<number> {
-		const processing = await this.#client.lrange(this.#processingKey(), 0, -1);
+		const client = await this.#client();
+		const processing = await client.lrange(this.#processingKey(), 0, -1);
 		let recovered = 0;
 		for (const raw of processing) {
 			let parsed: unknown;
@@ -157,18 +211,18 @@ export class RedisDriver implements QueueDriver {
 			} catch {
 				// Malformed JSON would otherwise sit in processing forever —
 				// LREM purges it so the queue makes progress.
-				await this.#client.lrem(this.#processingKey(), 1, raw);
+				await client.lrem(this.#processingKey(), 1, raw);
 				continue;
 			}
 			if (!isValidJob(parsed)) {
-				await this.#client.lrem(this.#processingKey(), 1, raw);
+				await client.lrem(this.#processingKey(), 1, raw);
 				continue;
 			}
-			const lease = await this.#client.get(this.#leaseKey(parsed.id));
+			const lease = await client.get(this.#leaseKey(parsed.id));
 			if (lease === null) {
-				await this.#client.lrem(this.#processingKey(), 1, raw);
+				await client.lrem(this.#processingKey(), 1, raw);
 				parsed.status = "pending";
-				await this.#client.rpush(this.#pendingKey(), JSON.stringify(parsed));
+				await client.rpush(this.#pendingKey(), JSON.stringify(parsed));
 				recovered++;
 			}
 		}
@@ -185,14 +239,15 @@ export class RedisDriver implements QueueDriver {
 	 * the lease has expired (e.g. recoverStale already handled it).
 	 */
 	async #removeFromProcessing(job: Job): Promise<void> {
-		const stored = await this.#client.get(this.#leaseKey(job.id));
+		const client = await this.#client();
+		const stored = await client.get(this.#leaseKey(job.id));
 		if (stored !== null) {
-			const removed = await this.#client.lrem(this.#processingKey(), 1, stored);
+			const removed = await client.lrem(this.#processingKey(), 1, stored);
 			if (removed > 0) return;
 		}
 		// Lease missing or already-LREM'd entry not found — best-effort scan
 		// matches by job id and removes the actual stored representation.
-		const items = await this.#client.lrange(this.#processingKey(), 0, -1);
+		const items = await client.lrange(this.#processingKey(), 0, -1);
 		for (const item of items) {
 			let parsed: unknown;
 			try {
@@ -201,14 +256,15 @@ export class RedisDriver implements QueueDriver {
 				continue;
 			}
 			if (isValidJob(parsed) && (parsed as { id: string }).id === job.id) {
-				await this.#client.lrem(this.#processingKey(), 1, item);
+				await client.lrem(this.#processingKey(), 1, item);
 				return;
 			}
 		}
 	}
 
 	async failed(): Promise<Job[]> {
-		const raws = await this.#client.lrange(this.#failedKey(), 0, -1);
+		const client = await this.#client();
+		const raws = await client.lrange(this.#failedKey(), 0, -1);
 		return raws
 			.map((r) => {
 				try {
@@ -222,6 +278,7 @@ export class RedisDriver implements QueueDriver {
 	}
 
 	async size(): Promise<number> {
-		return this.#client.llen(this.#pendingKey());
+		const client = await this.#client();
+		return client.llen(this.#pendingKey());
 	}
 }
