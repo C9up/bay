@@ -37,8 +37,9 @@ async function serverAnswers(): Promise<boolean> {
 	} catch {
 		return false;
 	} finally {
-		const open = probe.activeConnectionNames;
-		for (const name of open) await probe.disconnect(name);
+		// The one declared connection, by its literal name — `disconnect` is typed
+		// against the declared keys, so a plain string does not satisfy it.
+		await probe.disconnect("probe");
 	}
 }
 
