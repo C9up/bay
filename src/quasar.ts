@@ -27,19 +27,19 @@ function isConnectionSource(value: unknown): value is ConnectionSource {
 
 function isRedisClient(value: unknown): value is RedisClient {
 	if (typeof value !== "object" || value === null) return false;
-	// The commands this driver actually issues. A connection missing one of
-	// them would fail on the first job push, far from the cause.
+	// The commands this driver actually issues — every non-optional member of
+	// `RedisClient`. A connection missing one would fail on the first job push,
+	// far from the cause. `lmove` is deliberately absent: the driver declares it
+	// optional and falls back when it is not there.
 	const required = [
-		"get",
-		"set",
+		"rpush",
+		"lpop",
+		"lrem",
+		"llen",
+		"lrange",
 		"del",
-		"exists",
-		"keys",
-		"sadd",
-		"srem",
-		"smembers",
-		"expire",
-		"ttl",
+		"set",
+		"get",
 	];
 	return required.every(
 		(name) => typeof Reflect.get(value, name) === "function",
