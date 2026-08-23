@@ -17,7 +17,34 @@ import type { Job } from "../../src/QueueManager.js";
 import { quasarConnection } from "../../src/quasar.js";
 
 const url = process.env.REDIS_TEST_URL ?? "";
-const describeRedis = url ? describe : describe.skip;
+
+/**
+ * Skipped, not failed, when no server answers: a URL can be set and point at
+ * nothing. Probed through quasar (a devDependency here) rather than ioredis,
+ * which bay deliberately does not depend on.
+ */
+async function serverAnswers(): Promise<boolean> {
+	const probe = new QuasarManager({
+		connection: "probe" as const,
+		// Fail fast instead of letting ioredis retry a dead port forever.
+		connections: {
+			probe: { url, lazyConnect: true, maxRetriesPerRequest: 1 },
+		},
+	});
+	try {
+		await probe.connection().ping();
+		return true;
+	} catch {
+		return false;
+	} finally {
+		const open = probe.activeConnectionNames;
+		for (const name of open) await probe.disconnect(name);
+	}
+}
+
+const live = url ? await serverAnswers() : false;
+
+const describeRedis = live ? describe : describe.skip;
 
 const WORKERS = 12;
 /** One declared connection per worker: separate sockets, or the pops serialise
@@ -57,7 +84,11 @@ describeRedis("RedisDriver against a live Redis", () => {
 	});
 
 	afterAll(async () => {
-		await manager.quitAll();
+		// Closed one at a time rather than with quitAll(): CI resolves quasar from
+		// the registry, where the published version predates that method. quit(name)
+		// means the same in both.
+		const open = manager.activeConnectionNames;
+		for (const name of open) await manager.quit(name);
 		clearQuasar(manager);
 	});
 
