@@ -75,6 +75,17 @@ function warnWithoutLmove(client: RedisClient): void {
 	);
 }
 
+/**
+ * A key prefix that ends in a separator.
+ *
+ * `:` is Redis's conventional namespace separator; a prefix already ending in
+ * one of the usual separators is left alone.
+ */
+function withSeparator(prefix: string): string {
+	if (prefix.length === 0) return prefix;
+	return /[:.\-_/]$/.test(prefix) ? prefix : `${prefix}:`;
+}
+
 export class RedisDriver implements QueueDriver {
 	#source: RedisClientSource;
 	#resolved: RedisClient | undefined;
@@ -121,7 +132,11 @@ export class RedisDriver implements QueueDriver {
 		// landing at construction as it always did. A named connection has no
 		// client yet — it is checked when the connection resolves.
 		if (typeof source !== "function") warnWithoutLmove(source);
-		this.#prefix = options?.prefix ?? "queue:";
+		// Normalised rather than documented: every key is built by concatenation
+		// (`${prefix}pending`), so a prefix without a trailing separator yields
+		// "myapppending" — unreadable, and able to collide with a neighbouring
+		// prefix. Nothing warned, because nothing failed.
+		this.#prefix = withSeparator(options?.prefix ?? "queue:");
 		const visibilityTimeout = options?.visibilityTimeoutMs ?? 30_000;
 		// A non-positive / non-integer timeout makes pop()'s `SET … PX <ms>` fail
 		// on a real Redis; the catch then removes the job from `processing` and

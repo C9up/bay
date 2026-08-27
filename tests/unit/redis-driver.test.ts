@@ -300,6 +300,24 @@ describe("bay > RedisDriver > custom prefix", () => {
 		await driver.pop();
 		expect(fake.keys.has("myapp:lease:j")).toBe(true);
 	});
+
+	it("adds the separator a prefix is missing", async () => {
+		// Every key is built by concatenation, so "myapp" produced
+		// "myapppending" — unreadable, and able to collide with a neighbouring
+		// prefix. Nothing warned, because nothing failed.
+		const fake = createFakeRedis();
+		const driver = new RedisDriver(fake.client, { prefix: "myapp" });
+		await driver.push(makeJob({ id: "j" }));
+		expect(fake.lists.has("myapp:pending")).toBe(true);
+		expect(fake.lists.has("myapppending")).toBe(false);
+	});
+
+	it("leaves a prefix that already ends in a separator alone", async () => {
+		const fake = createFakeRedis();
+		const driver = new RedisDriver(fake.client, { prefix: "myapp." });
+		await driver.push(makeJob({ id: "j" }));
+		expect(fake.lists.has("myapp.pending")).toBe(true);
+	});
 });
 
 describe("bay > RedisDriver > processing-list fallback removal", () => {

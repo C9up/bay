@@ -13,7 +13,7 @@ ream configure @c9up/bay
 
 ## Usage
 
-Register the provider in your app, then configure it under `config/bay.ts`:
+Register the provider in your app, then configure it under `config/queue.ts` — the provider reads `config.get('queue')`, so a `config/bay.ts` would be loaded under the key `bay` and never seen:
 
 ```ts
 // reamrc.ts
