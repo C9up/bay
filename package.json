@@ -1,6 +1,6 @@
 {
   "name": "@c9up/bay",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Queue \u2014 pluggable job-queue contract with memory + Redis drivers for the Ream framework",
   "license": "MIT",
   "type": "module",
@@ -32,7 +32,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@c9up/ream": "^0.1.0",
+    "@c9up/ream": "^0.2.0",
     "@c9up/quasar": "^0.1.0"
   },
   "devDependencies": {
