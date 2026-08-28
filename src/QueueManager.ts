@@ -40,19 +40,18 @@ export interface QueueDriver {
 }
 
 export class QueueManager {
-	private driver: QueueDriver;
-	private handlers: Map<string, JobHandler | (new () => JobHandler)> =
-		new Map();
-	private running = false;
-	private inflightPromise: Promise<boolean> | null = null;
+	#driver: QueueDriver;
+	#handlers: Map<string, JobHandler | (new () => JobHandler)> = new Map();
+	#running = false;
+	#inflightPromise: Promise<boolean> | null = null;
 
 	constructor(driver: QueueDriver) {
-		this.driver = driver;
+		this.#driver = driver;
 	}
 
 	/** Register a job handler. */
 	register(name: string, handler: JobHandler | (new () => JobHandler)): void {
-		this.handlers.set(name, handler);
+		this.#handlers.set(name, handler);
 	}
 
 	/** Dispatch a job to the queue. */
@@ -74,21 +73,24 @@ export class QueueManager {
 			status: "pending",
 			createdAt: Date.now(),
 		};
-		await this.driver.push(job);
+		await this.#driver.push(job);
 		return id;
 	}
 
 	/** Process the next job in the queue. */
 	async processOne(): Promise<boolean> {
-		const job = await this.driver.pop();
+		const job = await this.#driver.pop();
 		if (!job) return false;
 
-		const handlerOrClass = this.handlers.get(job.name);
+		const handlerOrClass = this.#handlers.get(job.name);
 		if (!handlerOrClass) {
 			process.stderr.write(
 				`QueueManager: no handler registered for job '${job.name}'\n`,
 			);
-			await this.driver.fail(job, `No handler registered for job: ${job.name}`);
+			await this.#driver.fail(
+				job,
+				`No handler registered for job: ${job.name}`,
+			);
 			return true;
 		}
 
@@ -103,16 +105,16 @@ export class QueueManager {
 		try {
 			await handler.handle(job.payload);
 			job.status = "completed";
-			await this.driver.complete(job);
+			await this.#driver.complete(job);
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);
 			if (job.attempts < job.maxAttempts) {
 				job.status = "pending";
-				await this.driver.retry(job);
+				await this.#driver.retry(job);
 			} else {
 				job.status = "failed";
 				job.error = errorMsg;
-				await this.driver.fail(job, errorMsg);
+				await this.#driver.fail(job, errorMsg);
 			}
 		}
 
@@ -132,16 +134,16 @@ export class QueueManager {
 		if (recoverStaleMs <= 0) {
 			throw new Error("recoverStaleMs must be positive");
 		}
-		if (this.running) {
+		if (this.#running) {
 			throw new Error("QueueManager is already running");
 		}
-		this.running = true;
+		this.#running = true;
 		await this.#tryRecoverStale();
 		let lastRecover = Date.now();
-		while (this.running) {
+		while (this.#running) {
 			try {
-				this.inflightPromise = this.processOne();
-				const processed = await this.inflightPromise;
+				this.#inflightPromise = this.processOne();
+				const processed = await this.#inflightPromise;
 				if (!processed) {
 					await new Promise((r) => setTimeout(r, pollIntervalMs));
 				}
@@ -151,9 +153,9 @@ export class QueueManager {
 				);
 				await new Promise((r) => setTimeout(r, pollIntervalMs));
 			} finally {
-				this.inflightPromise = null;
+				this.#inflightPromise = null;
 			}
-			if (this.running && Date.now() - lastRecover >= recoverStaleMs) {
+			if (this.#running && Date.now() - lastRecover >= recoverStaleMs) {
 				await this.#tryRecoverStale();
 				lastRecover = Date.now();
 			}
@@ -178,29 +180,29 @@ export class QueueManager {
 	 * Called automatically by work(); also safe to schedule manually.
 	 */
 	async recoverStale(): Promise<number> {
-		return (await this.driver.recoverStale?.()) ?? 0;
+		return (await this.#driver.recoverStale?.()) ?? 0;
 	}
 
 	/** Await the currently in-flight processOne, if any. */
 	async drain(): Promise<void> {
-		if (this.inflightPromise) {
-			await this.inflightPromise.catch(() => {});
+		if (this.#inflightPromise) {
+			await this.#inflightPromise.catch(() => {});
 		}
 	}
 
 	/** Stop the worker. */
 	async stop(): Promise<void> {
-		this.running = false;
+		this.#running = false;
 		await this.drain();
 	}
 
 	/** Get failed jobs. */
 	async failedJobs(): Promise<Job[]> {
-		return this.driver.failed();
+		return this.#driver.failed();
 	}
 
 	/** Get queue size. */
 	async size(): Promise<number> {
-		return this.driver.size();
+		return this.#driver.size();
 	}
 }
