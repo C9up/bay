@@ -12,6 +12,7 @@ export type { RedisClient } from "./drivers/RedisDriver.js";
 export { RedisDriver } from "./drivers/RedisDriver.js";
 export type { Job, JobHandler, QueueDriver } from "./QueueManager.js";
 export { QueueManager } from "./QueueManager.js";
+export { type QueueStoreFactory, stores } from "./stores.js";
 
 import type { BayProviderConfig } from "./BayProvider.js";
 

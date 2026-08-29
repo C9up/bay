@@ -1,6 +1,6 @@
 {
   "name": "@c9up/bay",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Queue \u2014 pluggable job-queue contract with memory + Redis drivers for the Ream framework",
   "license": "MIT",
   "type": "module",
