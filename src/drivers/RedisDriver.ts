@@ -18,6 +18,7 @@
  * needs a thin adapter.
  */
 
+import { inProduction } from "../nodeEnv.js";
 import type { Job, QueueDriver } from "../QueueManager.js";
 
 export interface RedisClient {
@@ -65,8 +66,22 @@ export type RedisClientSource =
  * has no client to inspect yet.
  */
 const warned = new WeakSet<object>();
-function warnWithoutLmove(client: RedisClient): void {
-	if (typeof client.lmove === "function" || warned.has(client)) return;
+function checkLmove(client: RedisClient, allowNonAtomicPop: boolean): void {
+	if (typeof client.lmove === "function") return;
+
+	// A queue's whole promise is that a job it accepted gets run. Without LMOVE
+	// the pop is `lpop` then `rpush`, and a crash between the two deletes the
+	// job from pending before it reaches processing: nothing recovers it,
+	// because nothing knows it existed. That is a different product, and in
+	// production it must be asked for rather than fallen into.
+	if (inProduction() && !allowNonAtomicPop) {
+		throw new Error(
+			"[bay] this Redis client has no LMOVE (Redis < 6.2), so pop() would be a non-atomic lpop+rpush — " +
+				"a crash between the two loses the in-flight job, turning at-least-once delivery into at-most-once.\n" +
+				"  Upgrade to Redis 6.2 or later, or pass `allowNonAtomicPop: true` to state that losing a job is acceptable here.",
+		);
+	}
+	if (warned.has(client)) return;
 	warned.add(client);
 	console.warn(
 		"[bay] RedisDriver: client lacks LMOVE (Redis <6.2). pop() falls back to " +
@@ -101,7 +116,7 @@ export class RedisDriver implements QueueDriver {
 		if (this.#resolved) return this.#resolved;
 		if (typeof this.#source !== "function") {
 			this.#resolved = this.#source;
-			warnWithoutLmove(this.#resolved);
+			checkLmove(this.#resolved, this.#allowNonAtomicPop);
 			return this.#resolved;
 		}
 		if (!this.#pending) {
@@ -109,7 +124,7 @@ export class RedisDriver implements QueueDriver {
 			this.#pending = Promise.resolve(resolver())
 				.then((client) => {
 					this.#resolved = client;
-					warnWithoutLmove(client);
+					checkLmove(client, this.#allowNonAtomicPop);
 					return client;
 				})
 				// Cleared on failure too. Clearing only on success left the
@@ -125,18 +140,30 @@ export class RedisDriver implements QueueDriver {
 
 	constructor(
 		source: RedisClientSource,
-		options?: { prefix?: string; visibilityTimeoutMs?: number },
+		options?: {
+			prefix?: string;
+			visibilityTimeoutMs?: number;
+			/**
+			 * Accept the non-atomic pop on a Redis older than 6.2, in
+			 * production. Off by default: losing an accepted job is a choice a
+			 * deployment makes, not one a version check makes for it.
+			 */
+			allowNonAtomicPop?: boolean;
+		},
 	) {
 		this.#source = source;
 		// A client handed in directly can be checked now, so the warning keeps
 		// landing at construction as it always did. A named connection has no
 		// client yet — it is checked when the connection resolves.
-		if (typeof source !== "function") warnWithoutLmove(source);
+		if (typeof source !== "function") {
+			checkLmove(source, options?.allowNonAtomicPop ?? false);
+		}
 		// Normalised rather than documented: every key is built by concatenation
 		// (`${prefix}pending`), so a prefix without a trailing separator yields
 		// "myapppending" — unreadable, and able to collide with a neighbouring
 		// prefix. Nothing warned, because nothing failed.
 		this.#prefix = withSeparator(options?.prefix ?? "queue:");
+		this.#allowNonAtomicPop = options?.allowNonAtomicPop ?? false;
 		const visibilityTimeout = options?.visibilityTimeoutMs ?? 30_000;
 		// A non-positive / non-integer timeout makes pop()'s `SET … PX <ms>` fail
 		// on a real Redis; the catch then removes the job from `processing` and
@@ -152,6 +179,7 @@ export class RedisDriver implements QueueDriver {
 
 	#pendingKey = () => `${this.#prefix}pending`;
 	#processingKey = () => `${this.#prefix}processing`;
+	#allowNonAtomicPop = false;
 	#failedKey = () => `${this.#prefix}failed`;
 	#leaseKey = (jobId: string) => `${this.#prefix}lease:${jobId}`;
 

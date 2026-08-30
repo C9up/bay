@@ -43,6 +43,10 @@ export class QueueManager {
 	#driver: QueueDriver;
 	#handlers: Map<string, JobHandler | (new () => JobHandler)> = new Map();
 	#running = false;
+	/** The running loop, so `stop()` can wait for it to finish. */
+	#loopPromise: Promise<void> | undefined;
+	/** Cuts the sleep between polls short. */
+	#wake: (() => void) | undefined;
 	#inflightPromise: Promise<boolean> | null = null;
 
 	constructor(driver: QueueDriver) {
@@ -138,20 +142,36 @@ export class QueueManager {
 			throw new Error("QueueManager is already running");
 		}
 		this.#running = true;
+		const loop = this.#loop(pollIntervalMs, recoverStaleMs);
+		this.#loopPromise = loop;
+		try {
+			await loop;
+		} finally {
+			this.#loopPromise = undefined;
+		}
+	}
+
+	/**
+	 * The polling loop itself.
+	 *
+	 * Between jobs it sleeps, and that sleep is CANCELLABLE: `stop()` wakes it
+	 * rather than waiting out the interval. Without that, stopping returned
+	 * while the loop was still pending — up to a full poll interval of a worker
+	 * that was supposed to be gone, and a timer holding the process open.
+	 */
+	async #loop(pollIntervalMs: number, recoverStaleMs: number): Promise<void> {
 		await this.#tryRecoverStale();
 		let lastRecover = Date.now();
 		while (this.#running) {
 			try {
 				this.#inflightPromise = this.processOne();
 				const processed = await this.#inflightPromise;
-				if (!processed) {
-					await new Promise((r) => setTimeout(r, pollIntervalMs));
-				}
+				if (!processed) await this.#sleep(pollIntervalMs);
 			} catch (err) {
 				process.stderr.write(
 					`QueueManager processOne error: ${err instanceof Error ? err.message : String(err)}\n`,
 				);
-				await new Promise((r) => setTimeout(r, pollIntervalMs));
+				await this.#sleep(pollIntervalMs);
 			} finally {
 				this.#inflightPromise = null;
 			}
@@ -160,6 +180,21 @@ export class QueueManager {
 				lastRecover = Date.now();
 			}
 		}
+	}
+
+	/** Wait, unless `stop()` says otherwise first. */
+	#sleep(ms: number): Promise<void> {
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => {
+				this.#wake = undefined;
+				resolve();
+			}, ms);
+			this.#wake = () => {
+				clearTimeout(timer);
+				this.#wake = undefined;
+				resolve();
+			};
+		});
 	}
 
 	/** recoverStale() wrapper that swallows driver errors — used by the work loop. */
@@ -190,10 +225,18 @@ export class QueueManager {
 		}
 	}
 
-	/** Stop the worker. */
+	/**
+	 * Stop the worker and wait for it to actually be gone.
+	 *
+	 * Awaits the LOOP, not just the job in flight: a stop that returns while
+	 * the loop is still sleeping leaves a worker running past the teardown that
+	 * asked it to stop.
+	 */
 	async stop(): Promise<void> {
 		this.#running = false;
+		this.#wake?.();
 		await this.drain();
+		if (this.#loopPromise) await this.#loopPromise.catch(() => {});
 	}
 
 	/** Get failed jobs. */

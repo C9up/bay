@@ -303,3 +303,58 @@ describe("bay > QueueManager > recoverStale", () => {
 		expect(driver.recoverCalls).toBe(1);
 	});
 });
+
+describe("bay > stopping a worker whose job blew up", () => {
+	/** A driver whose pop() rejects, so the in-flight promise is a rejected one. */
+	class FailingDriver implements QueueDriver {
+		pops = 0;
+		async push(): Promise<void> {}
+		async pop(): Promise<Job | null> {
+			this.pops++;
+			throw new Error("driver is down");
+		}
+		async complete(): Promise<void> {}
+		async fail(): Promise<void> {}
+		async retry(): Promise<void> {}
+		async failed(): Promise<Job[]> {
+			return [];
+		}
+		async size(): Promise<number> {
+			return 0;
+		}
+		async clear(): Promise<void> {}
+	}
+
+	it("stops cleanly, and the failure does not escape as an unhandled rejection", async () => {
+		const driver = new FailingDriver();
+		const queue = new QueueManager(driver);
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+
+		const working = queue.work(10);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		// `stop()` awaits the in-flight job AND the loop; both saw the same
+		// rejection, and neither may surface it a second time.
+		await expect(queue.stop()).resolves.toBeUndefined();
+		await expect(working).resolves.toBeUndefined();
+
+		expect(driver.pops).toBeGreaterThan(0);
+		expect(stderr).toHaveBeenCalled();
+		stderr.mockRestore();
+	});
+
+	it("is idempotent — stopping twice is not an error", async () => {
+		const queue = new QueueManager(new FailingDriver());
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+
+		const working = queue.work(10);
+		await queue.stop();
+		await expect(queue.stop()).resolves.toBeUndefined();
+		await working;
+
+		stderr.mockRestore();
+	});
+});

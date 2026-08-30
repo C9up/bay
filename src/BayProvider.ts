@@ -1,7 +1,7 @@
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
 import type { QueueDriver } from "./QueueManager.js";
 import { QueueManager } from "./QueueManager.js";
-import { setQueue } from "./services/main.js";
+import { clearQueue, getQueue, setQueue } from "./services/main.js";
 import type { QueueStoreFactory } from "./stores.js";
 
 /**
@@ -122,11 +122,30 @@ export default class BayProvider {
 		);
 	}
 
+	/** The queue THIS provider booted — not whatever the module singleton holds. */
+	#queue: QueueManager | undefined;
+
 	async boot(): Promise<void> {
 		// Populate the `@c9up/bay/services/main` singleton so apps can
 		// `import queue from '@c9up/bay/services/main'` from anywhere.
-		setQueue(await this.app.container.resolve<QueueManager>(QueueManager));
+		this.#queue = await this.app.container.resolve<QueueManager>(QueueManager);
+		setQueue(this.#queue);
 	}
 
-	async shutdown(): Promise<void> {}
+	/**
+	 * Stop the worker the app started, and let the job in flight finish.
+	 *
+	 * A worker polls on a timer. Left running, it survives a dev reload, a test
+	 * teardown and a SIGTERM — so the old process keeps pulling jobs the new
+	 * one is also pulling, and the same job runs twice.
+	 */
+	async shutdown(): Promise<void> {
+		if (!this.#queue) return;
+		await this.#queue.stop();
+		// Two applications can share a process — parallel tests, a hot reload.
+		// The module singleton holds whichever booted last, so it is only ours
+		// to clear while it still points at the queue this provider booted.
+		if (getQueue() === this.#queue) clearQueue();
+		this.#queue = undefined;
+	}
 }

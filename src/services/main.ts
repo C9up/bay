@@ -27,6 +27,14 @@ export function getQueue(): QueueManager | undefined {
 	return instance;
 }
 
+/**
+ * @internal Release the singleton, so a shut-down application does not leave a
+ * dead queue reachable through `services/main`.
+ */
+export function clearQueue(): void {
+	instance = undefined;
+}
+
 const queue: QueueManager = new Proxy({} as QueueManager, {
 	get(_target, prop) {
 		// A module loader inspects what it imports before anyone uses it: it reads

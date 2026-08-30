@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type RedisClient,
 	RedisDriver,
@@ -345,5 +345,167 @@ describe("bay > RedisDriver > processing-list fallback removal", () => {
 		await driver.complete(job);
 		const remaining = fake.lists.get("queue:processing") ?? [];
 		expect(remaining).toEqual(["{{not-json"]);
+	});
+});
+
+describe("bay > RedisDriver > the shapes it refuses", () => {
+	it("refuses a popped value that is not an object at all", async () => {
+		const fake = createFakeRedis();
+		const driver = new RedisDriver(fake.client);
+
+		// Valid JSON that is not a job — a `null`, a number, an array. Trusting
+		// it would put a non-job through the handler.
+		for (const value of ["null", "42", '"a string"', "[]"]) {
+			await fake.client.rpush("queue:pending", value);
+			expect(await driver.pop(), value).toBeNull();
+		}
+	});
+
+	it("refuses a job-shaped object with one field of the wrong type", async () => {
+		const fake = createFakeRedis();
+		const driver = new RedisDriver(fake.client);
+		const complete = {
+			id: "1",
+			name: "welcome",
+			attempts: 0,
+			maxAttempts: 3,
+			status: "pending",
+			payload: {},
+		};
+
+		for (const field of ["id", "name", "attempts", "maxAttempts", "status"]) {
+			await fake.client.rpush(
+				"queue:pending",
+				JSON.stringify({ ...complete, [field]: { wrong: true } }),
+			);
+			expect(await driver.pop(), field).toBeNull();
+		}
+	});
+});
+
+describe("bay > RedisDriver > removing a job whose lease is gone", () => {
+	it("finds it by id and removes the entry that is actually stored", async () => {
+		const fake = createFakeRedis();
+		const driver = new RedisDriver(fake.client);
+		await driver.push(makeJob({ id: "j1" }));
+		const job = defined(await driver.pop());
+		// The lease is what `complete` normally matches on; without it the
+		// driver has to fall back to scanning the processing list, or the job
+		// stays there forever and gets recovered as stale.
+		await fake.client.del(`queue:lease:${job.id}`);
+
+		await driver.complete(job);
+
+		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(0);
+	});
+
+	it("leaves the list alone when nothing in it matches", async () => {
+		const fake = createFakeRedis();
+		const driver = new RedisDriver(fake.client);
+		await driver.push(makeJob({ id: "j1" }));
+		const job = defined(await driver.pop());
+		await fake.client.del(`queue:lease:${job.id}`);
+		await fake.client.lrem("queue:processing", 1, JSON.stringify(job));
+		await fake.client.rpush("queue:processing", "not json");
+		await fake.client.rpush(
+			"queue:processing",
+			JSON.stringify({ ...job, id: "someone-else" }),
+		);
+
+		await driver.complete(job);
+
+		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(2);
+	});
+});
+
+describe("bay > a Redis without LMOVE is not silently accepted in production", () => {
+	const original = process.env.NODE_ENV;
+	afterEach(() => {
+		process.env.NODE_ENV = original;
+	});
+
+	/** A client from before Redis 6.2: everything but LMOVE. */
+	const oldClient = () => {
+		const { client } = createFakeRedis({ withLmove: false });
+		return client;
+	};
+
+	it("warns outside production and keeps working", () => {
+		process.env.NODE_ENV = "development";
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		expect(() => new RedisDriver(oldClient())).not.toThrow();
+
+		expect(warn).toHaveBeenCalled();
+		warn.mockRestore();
+	});
+
+	it("refuses in production", () => {
+		process.env.NODE_ENV = "production";
+
+		// The pop becomes lpop+rpush: a crash between the two deletes the job
+		// from pending before it reaches processing, and nothing recovers it
+		// because nothing knows it existed.
+		expect(() => new RedisDriver(oldClient())).toThrow(/no LMOVE/);
+	});
+
+	it("refuses under the `prod` spelling too", () => {
+		process.env.NODE_ENV = "prod";
+
+		expect(() => new RedisDriver(oldClient())).toThrow(/no LMOVE/);
+	});
+
+	it("accepts it when the deployment says so explicitly", () => {
+		process.env.NODE_ENV = "production";
+
+		expect(
+			() => new RedisDriver(oldClient(), { allowNonAtomicPop: true }),
+		).not.toThrow();
+	});
+
+	it("says nothing when the client has LMOVE", () => {
+		process.env.NODE_ENV = "production";
+		const { client } = createFakeRedis({ withLmove: true });
+
+		expect(() => new RedisDriver(client)).not.toThrow();
+	});
+});
+
+describe("bay > NODE_ENV aliases decide whether the lossy pop is accepted", () => {
+	const original = process.env.NODE_ENV;
+	afterEach(() => {
+		process.env.NODE_ENV = original;
+	});
+
+	const oldClient = () => createFakeRedis({ withLmove: false }).client;
+
+	it("folds every production spelling", () => {
+		for (const value of ["prod", "production", "PROD", "Production"]) {
+			process.env.NODE_ENV = value;
+			expect(() => new RedisDriver(oldClient()), value).toThrow(/no LMOVE/);
+		}
+	});
+
+	it("folds the development and test spellings, which only warn", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		for (const value of ["dev", "develop", "development", "test", "testing"]) {
+			process.env.NODE_ENV = value;
+			expect(() => new RedisDriver(oldClient()), value).not.toThrow();
+		}
+		warn.mockRestore();
+	});
+
+	it("treats an unset or unrecognised environment as not production", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		process.env.NODE_ENV = "staging";
+		expect(() => new RedisDriver(oldClient())).not.toThrow();
+
+		// Absent is not production either — the refusal is for a deployment
+		// that says it is one.
+		delete process.env.NODE_ENV;
+		expect(() => new RedisDriver(oldClient())).not.toThrow();
+
+		warn.mockRestore();
 	});
 });
