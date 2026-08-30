@@ -11,6 +11,9 @@ pnpm add @c9up/bay
 ream configure @c9up/bay
 ```
 
+`ream add @c9up/bay` installs it, registers the provider and writes
+`config/queue.ts`. The rest of this page assumes that has run.
+
 ## Usage
 
 Register the provider, then name the queue backend in `config/queue.ts` — the
