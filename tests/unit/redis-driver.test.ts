@@ -517,3 +517,62 @@ describe("bay > NODE_ENV aliases decide whether the lossy pop is accepted", () =
 		warn.mockRestore();
 	});
 });
+
+describe("bay > a transient Redis failure does not swallow a reserved job", () => {
+	it("leaves the job in processing when the lease cannot be written", async () => {
+		const fake = createFakeRedis({ withLmove: true });
+		const driver = new RedisDriver(fake.client);
+		await driver.push(makeJob({ id: "j1" }));
+		// The move succeeded; the lease write is what blips.
+		fake.client.set = async () => {
+			throw new Error("READONLY You can't write against a replica");
+		};
+
+		await expect(driver.pop()).rejects.toThrow(/READONLY/);
+
+		// Deleting it here would lose it for good: it is already out of
+		// pending, and recoverStale() only ever scans processing.
+		expect(fake.lists.get("queue:processing")).toHaveLength(1);
+	});
+
+	it("and recoverStale puts that job back where a worker will see it", async () => {
+		const fake = createFakeRedis({ withLmove: true });
+		const driver = new RedisDriver(fake.client);
+		await driver.push(makeJob({ id: "j1" }));
+		const set = fake.client.set;
+		fake.client.set = async () => {
+			throw new Error("READONLY");
+		};
+		await driver.pop().catch(() => undefined);
+		fake.client.set = set;
+
+		const recovered = await driver.recoverStale();
+
+		// No lease was ever written, which is exactly the state recoverStale
+		// reclaims. At-least-once survives the blip.
+		expect(recovered).toBe(1);
+		expect(fake.lists.get("queue:pending")).toHaveLength(1);
+		expect(fake.lists.get("queue:processing")).toHaveLength(0);
+	});
+
+	it("still purges a payload that can never be run", async () => {
+		const fake = createFakeRedis({ withLmove: true });
+		const driver = new RedisDriver(fake.client);
+		await fake.client.rpush("queue:pending", "not json at all");
+
+		expect(await driver.pop()).toBeNull();
+
+		// A poison pill is the one case where deleting is right: it would sit
+		// in processing forever, wasting every recovery pass.
+		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(0);
+	});
+
+	it("purges a JSON payload that is not a job either", async () => {
+		const fake = createFakeRedis({ withLmove: true });
+		const driver = new RedisDriver(fake.client);
+		await fake.client.rpush("queue:pending", JSON.stringify({ nope: true }));
+
+		expect(await driver.pop()).toBeNull();
+		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(0);
+	});
+});

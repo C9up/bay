@@ -213,26 +213,37 @@ export class RedisDriver implements QueueDriver {
 		}
 
 		if (!raw) return null;
+
+		// Only a payload that can never be run is purged. Everything past this
+		// point is a REAL job that already sits in `processing`, and deleting
+		// it there is the one thing that loses it for good: it is gone from
+		// pending too, and recoverStale() scans processing, so nothing would
+		// ever find it again.
+		let parsed: unknown;
 		try {
-			const parsed: unknown = JSON.parse(raw);
-			if (!isValidJob(parsed)) {
-				// Malformed payload — purge from `processing` so it can't sit
-				// there indefinitely as a poison pill. recoverStale() also
-				// catches survivors but pop()'s own move is the primary path.
-				await client.lrem(this.#processingKey(), 1, raw);
-				return null;
-			}
-			await client.set(
-				this.#leaseKey(parsed.id),
-				raw,
-				"PX",
-				String(this.#visibilityTimeout),
-			);
-			return parsed;
+			parsed = JSON.parse(raw);
 		} catch {
+			// A poison pill: unparseable, and it would sit in processing
+			// forever blocking nothing but wasting every recovery pass.
 			await client.lrem(this.#processingKey(), 1, raw);
 			return null;
 		}
+		if (!isValidJob(parsed)) {
+			await client.lrem(this.#processingKey(), 1, raw);
+			return null;
+		}
+
+		// A lease that cannot be written is a transient Redis failure, not a
+		// bad job. The error propagates and the job STAYS in processing with
+		// no lease, which is precisely the state recoverStale() puts back in
+		// pending — so the delivery guarantee survives the blip.
+		await client.set(
+			this.#leaseKey(parsed.id),
+			raw,
+			"PX",
+			String(this.#visibilityTimeout),
+		);
+		return parsed;
 	}
 
 	async complete(job: Job): Promise<void> {
