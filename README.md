@@ -63,6 +63,30 @@ like it worked until a restart dropped every pending job.
 bay never imports quasar, which stays an optional peer. Pass an ioredis-shaped
 client (or a function answering one) to use any other.
 
+## Delivery guarantee, and the one way to lose it
+
+A job the queue accepted gets run: `pop()` moves it from pending to processing
+in a single `LMOVE`, so a worker that dies mid-job leaves the job recoverable
+rather than gone.
+
+`LMOVE` needs **Redis 6.2 or later**. Without it the move is `lpop` then
+`rpush`, and a crash between the two deletes the job from pending before it
+reaches processing — nothing recovers it, because nothing knows it existed.
+That turns at-least-once delivery into at-most-once.
+
+So on an older Redis the driver **refuses to start in production**, and says
+which two ways out there are:
+
+```ts
+// Either upgrade the server, or state that losing a job is acceptable here:
+stores.redis({ connection: 'jobs', allowNonAtomicPop: true })
+```
+
+The opt-in is honoured and still logs a warning on every process that starts
+with it, naming production — agreeing once in a config file is not the same as
+being reminded, in the logs of an incident, that this is how the process was
+running. Outside production the fallback simply warns.
+
 ## Entry points
 
 - `@c9up/bay` — main API

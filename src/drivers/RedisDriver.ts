@@ -83,10 +83,18 @@ function checkLmove(client: RedisClient, allowNonAtomicPop: boolean): void {
 	}
 	if (warned.has(client)) return;
 	warned.add(client);
+
+	// Said even when the deployment opted in: agreeing to lose a job once, in a
+	// config file, is not the same as being reminded that this process is
+	// running that way. The line has to be in the logs of the incident.
+	const optedIn = inProduction() && allowNonAtomicPop;
 	console.warn(
 		"[bay] RedisDriver: client lacks LMOVE (Redis <6.2). pop() falls back to " +
 			"a non-atomic lpop+rpush, downgrading delivery from at-least-once to " +
-			"at-most-once — a crash between the two commands loses the in-flight job.",
+			"at-most-once — a crash between the two commands loses the in-flight job." +
+			(optedIn
+				? "\n  Running this way in PRODUCTION because allowNonAtomicPop was set."
+				: ""),
 	);
 }
 

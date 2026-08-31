@@ -455,12 +455,20 @@ describe("bay > a Redis without LMOVE is not silently accepted in production", (
 		expect(() => new RedisDriver(oldClient())).toThrow(/no LMOVE/);
 	});
 
-	it("accepts it when the deployment says so explicitly", () => {
+	it("accepts it when the deployment says so explicitly — and says so loudly", () => {
 		process.env.NODE_ENV = "production";
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 		expect(
 			() => new RedisDriver(oldClient(), { allowNonAtomicPop: true }),
 		).not.toThrow();
+
+		// Agreeing once in a config file is not the same as being reminded
+		// that this process is running that way — the line has to be in the
+		// logs of the incident.
+		expect(warn).toHaveBeenCalledOnce();
+		expect(String(warn.mock.calls[0]?.[0])).toContain("PRODUCTION");
+		warn.mockRestore();
 	});
 
 	it("says nothing when the client has LMOVE", () => {
