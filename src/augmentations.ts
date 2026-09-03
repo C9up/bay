@@ -21,6 +21,11 @@ import type { QueueManager } from "./QueueManager.js";
 declare module "@c9up/ream/types" {
 	interface ContainerBindings {
 		/** The job queue, bound by `BayProvider`. */
+		"bay.queue": QueueManager;
+		/**
+		 * The same binding under the name it had before the token carried its
+		 * package. Kept bound so an existing `container.make(...)` resolves.
+		 */
 		queue: QueueManager;
 	}
 }

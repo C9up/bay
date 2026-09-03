@@ -184,3 +184,56 @@ describe("bay > the worker block", () => {
 		expect(await manager.size()).toBe(0);
 	});
 });
+
+describe("bay > the token the framework namespaces", () => {
+	function bindingsFrom(
+		config: BayProviderConfig,
+	): Map<unknown, () => unknown> {
+		const bindings = new Map<unknown, () => unknown>();
+		// A `singleton` that builds once, which is the whole difference between
+		// it and a plain binding — without it the two tokens would each get
+		// their own manager here for a reason the provider is not responsible
+		// for.
+		const built = new Map<unknown, unknown>();
+		const app = {
+			container: {
+				singleton(token: unknown, factory: () => unknown) {
+					bindings.set(token, () => {
+						if (!built.has(token)) built.set(token, factory());
+						return built.get(token);
+					});
+				},
+				resolve: <T>(token: unknown): T => bindings.get(token)?.() as T,
+			},
+			config: { get: <T>() => config as T },
+		};
+		// biome-ignore lint/suspicious/noExplicitAny: the provider's app context is
+		// structural; the stub above is the slice register() touches.
+		new BayProvider(app as any).register();
+		return bindings;
+	}
+
+	it("binds the queue under its package and under the bare name", async () => {
+		const bindings = bindingsFrom({
+			default: "memory",
+			adapters: { memory: drivers.memory() },
+		});
+
+		// Upstream namespaces `lucid.db`, `auth.manager`, `queue.manager` by the
+		// package that owns them; the bare token is what existing calls ask for.
+		expect(bindings.has("bay.queue")).toBe(true);
+		expect(bindings.has("queue")).toBe(true);
+	});
+
+	it("hands back the same manager through either name", async () => {
+		const bindings = bindingsFrom({
+			default: "memory",
+			adapters: { memory: drivers.memory() },
+		});
+
+		const namespaced = await bindings.get("bay.queue")?.();
+		const bare = await bindings.get("queue")?.();
+		expect(namespaced).toBeInstanceOf(QueueManager);
+		expect(namespaced).toBe(bare);
+	});
+});

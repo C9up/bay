@@ -146,11 +146,20 @@ describe("bay > the provider", () => {
 		};
 	};
 
-	it("binds the manager under both the class and the string token", async () => {
+	it("binds the manager under the class and both string tokens", async () => {
 		const context = app(defineConfig({}));
 		new BayProvider(context).register();
 
-		expect([...context.bindings.keys()]).toEqual([QueueManager, "queue"]);
+		// `bay.queue` is the namespaced form upstream uses for a satellite's
+		// binding; the bare `queue` stays for everything already asking for it.
+		expect([...context.bindings.keys()]).toEqual([
+			QueueManager,
+			"bay.queue",
+			"queue",
+		]);
+		expect(await context.container.resolve("bay.queue")).toBeInstanceOf(
+			QueueManager,
+		);
 		expect(await context.container.resolve("queue")).toBeInstanceOf(
 			QueueManager,
 		);

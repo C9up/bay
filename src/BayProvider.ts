@@ -134,9 +134,15 @@ export default class BayProvider {
 			const config = this.app.config.get<BayProviderConfig>("queue");
 			return new QueueManager(buildDriver(config), config?.worker);
 		});
-		this.app.container.singleton("queue", () =>
-			this.app.container.resolve<QueueManager>(QueueManager),
-		);
+		// Namespaced by the package that owns it, the way upstream namespaces
+		// `lucid.db`, `auth.manager` and `drive.manager` by theirs. The bare
+		// token stays bound beside it: it is what every existing
+		// `container.make(...)` asks for, and a token is not worth breaking an
+		// application over.
+		const queue = (): Promise<QueueManager> =>
+			this.app.container.resolve<QueueManager>(QueueManager);
+		this.app.container.singleton("bay.queue", queue);
+		this.app.container.singleton("queue", queue);
 	}
 
 	/** The queue THIS provider booted — not whatever the module singleton holds. */
