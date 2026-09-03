@@ -22,23 +22,23 @@ export async function configure(codemods: Codemods): Promise<void> {
 	// without them leaves an application whose config asks the environment for
 	// something nothing ever put there.
 	await codemods.addEnvVars({
-		QUEUE_STORE: "memory",
+		QUEUE_DRIVER: "memory",
 	});
 
 	await codemods.addProvider("@c9up/bay/provider");
 	await codemods.writeFile(
 		"config/queue.ts",
-		`import { defineConfig, stores } from '@c9up/bay'
+		`import { defineConfig, drivers } from '@c9up/bay'
 import env from '#start/env'
 
 export default defineConfig({
-  // Which store to run on. Memory forgets everything on restart, which is
+  // Which adapter to run on. Memory forgets everything on restart, which is
   // what a single process in development wants and nothing else does.
-  default: env.get('QUEUE_STORE', 'memory'),
+  default: env.get('QUEUE_DRIVER', 'memory'),
 
-  stores: {
-    memory: stores.memory(),
-    redis: stores.redis({ connection: 'main' }),
+  adapters: {
+    memory: drivers.memory(),
+    redis: drivers.redis({ connection: 'main' }),
   },
 })`,
 	);

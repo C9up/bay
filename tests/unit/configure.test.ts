@@ -46,7 +46,7 @@ describe("bay > configure", () => {
 
 		// Writing the file without them leaves an application whose config asks
 		// the environment for something nothing ever put there.
-		expect(env).toHaveProperty("QUEUE_STORE");
+		expect(env).toHaveProperty("QUEUE_DRIVER");
 		for (const key of Object.keys(env)) {
 			expect(files[0]?.content).toContain(key);
 		}

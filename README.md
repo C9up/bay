@@ -29,17 +29,21 @@ providers: [
 
 ```ts
 // config/queue.ts
-import { defineConfig, stores } from '@c9up/bay'
+import { defineConfig, drivers } from '@c9up/bay'
 import env from '#start/env'
 
 export default defineConfig({
-  default: env.get('QUEUE_STORE'),
-  stores: {
-    memory: stores.memory(),
-    redis:  stores.redis({ connection: 'main' }),
+  default: env.get('QUEUE_DRIVER'),
+  adapters: {
+    memory: drivers.memory(),
+    redis:  drivers.redis({ connection: 'main' }),
   },
 })
 ```
+
+The keys are the framework's: `default` + `adapters`, filled from a `drivers`
+namespace, selected by `QUEUE_DRIVER`. Bay used to say `stores` / `QUEUE_STORE`;
+both names still resolve, so an existing `config/queue.ts` keeps working.
 
 ```ts
 // start/queue.ts
@@ -49,17 +53,17 @@ queue.register('send-email', new SendEmailJob())
 await queue.dispatch('send-email', { to: 'user@example.com' })
 ```
 
-| Store | Keeps jobs | Use it when |
+| Adapter | Keeps jobs | Use it when |
 | --- | --- | --- |
-| `stores.memory()` | until the process exits | tests, and local work |
-| `stores.redis({ connection })` | in Redis | anything that must survive a restart |
+| `drivers.memory()` | until the process exits | tests, and local work |
+| `drivers.redis({ connection })` | in Redis | anything that must survive a restart |
 
-Factories are lazy: only the store actually selected is built, so naming a Redis
-queue in a config that runs in memory opens no connection. A `default` that
-names nothing throws, listing what exists — falling back to memory would look
-like it worked until a restart dropped every pending job.
+Factories are lazy: only the adapter actually selected is built, so naming a
+Redis queue in a config that runs in memory opens no connection. A `default`
+that names nothing throws, listing what exists — falling back to memory would
+look like it worked until a restart dropped every pending job.
 
-`stores.redis` takes a `@c9up/quasar` connection name, resolved at first use so
+`drivers.redis` takes a `@c9up/quasar` connection name, resolved at first use so
 bay never imports quasar, which stays an optional peer. Pass an ioredis-shaped
 client (or a function answering one) to use any other.
 
@@ -79,13 +83,44 @@ which two ways out there are:
 
 ```ts
 // Either upgrade the server, or state that losing a job is acceptable here:
-stores.redis({ connection: 'jobs', allowNonAtomicPop: true })
+drivers.redis({ connection: 'jobs', allowNonAtomicPop: true })
 ```
 
 The opt-in is honoured and still logs a warning on every process that starts
 with it, naming production — agreeing once in a config file is not the same as
 being reminded, in the logs of an incident, that this is how the process was
 running. Outside production the fallback simply warns.
+
+## A worker that dies, and a handler that is merely slow
+
+A job taken off the queue is held under a **lease** — `visibilityTimeoutMs`,
+30 s by default. While the lease is alive the job belongs to the worker holding
+it; once it expires, `recoverStale()` puts the job back in pending, which is how
+a crashed worker's job gets run at all.
+
+Two things follow, and both are handled rather than left to the deployment:
+
+**A slow handler is not a dead worker.** For as long as a handler runs, the
+worker renews its own lease — half the timeout, so one slow round-trip is not
+enough to lose the job. Without that, any handler outliving 30 s was recovered
+and re-delivered *while it was still running*, and the same job ran twice.
+Renewal is refused once the lease is gone or has passed to another worker, so a
+late heartbeat cannot resurrect somebody else's claim.
+
+**A job that kills its worker is bounded.** A crash never reaches the failure
+path, so `attempts` never moves and `maxAttempts` never applies — a job that
+takes the process down with it was recovered forever. `maxStalledCount`
+(default `1`) caps how many times a job may be reclaimed before it is filed as
+failed instead.
+
+```ts
+drivers.redis({
+  connection: 'jobs',
+  visibilityTimeoutMs: 30_000, // how long a worker owns a job it took
+  maxStalledCount: 1,          // reclaims allowed before the job is failed
+  maxFailedJobs: 1_000,        // failed jobs kept (needs LTRIM on the client)
+})
+```
 
 ## Entry points
 

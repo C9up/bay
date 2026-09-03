@@ -17,6 +17,15 @@ export interface Job {
 	error?: string;
 	createdAt: number;
 	processedAt?: number;
+	/**
+	 * How many times this job has been recovered from a stalled worker.
+	 *
+	 * Separate from `attempts`, which counts times a handler RAN. A worker that
+	 * dies mid-job never reaches the failure path, so `attempts` cannot see it —
+	 * upstream carries the same two counters side by side for the same reason
+	 * (`JobData.stalledCount` in `@boringnode/queue`).
+	 */
+	stalledCount?: number;
 }
 
 export interface JobHandler {
@@ -37,6 +46,18 @@ export interface QueueDriver {
 	 * recovered. In-memory drivers omit this — their jobs don't survive a crash.
 	 */
 	recoverStale?(): Promise<number>;
+	/**
+	 * Optional lease renewal: tell the driver this job is still being worked on,
+	 * answering `false` when the claim is gone (already recovered, or now held
+	 * by another worker). Drivers with no lease omit it.
+	 */
+	renew?(job: Job): Promise<boolean>;
+	/**
+	 * How often the worker should call `renew` while a handler runs. The driver
+	 * sets the cadence because the driver owns the deadline. Absent means no
+	 * renewal.
+	 */
+	readonly renewIntervalMs?: number;
 }
 
 export class QueueManager {
@@ -106,10 +127,17 @@ export class QueueManager {
 		job.status = "processing";
 		job.processedAt = Date.now();
 
+		// The lease a driver takes at pop() has a deadline, and a handler slower
+		// than that deadline was being recovered and re-delivered WHILE IT WAS
+		// STILL RUNNING — a second worker picked the job up, and the first one's
+		// completion then removed an entry the second one owned. Upstream calls
+		// the same mechanism a heartbeat (`Adapter.renewJobs`); a driver without
+		// a lease supplies no cadence and nothing is scheduled.
+		const stopRenewing = this.#startRenewing(job);
+		let handled = false;
 		try {
 			await handler.handle(job.payload);
-			job.status = "completed";
-			await this.#driver.complete(job);
+			handled = true;
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);
 			if (job.attempts < job.maxAttempts) {
@@ -120,9 +148,48 @@ export class QueueManager {
 				job.error = errorMsg;
 				await this.#driver.fail(job, errorMsg);
 			}
+		} finally {
+			stopRenewing();
+		}
+
+		// Outside the catch, and deliberately. Marking the job done is a write to
+		// the driver, and a write can fail on its own — a Redis blip, a closed
+		// connection. Inside, that failure was read as the HANDLER having failed:
+		// the job went round again and the handler ran a second time, and once
+		// `attempts` ran out the job was filed as failed with the driver's error
+		// on it. A job that succeeded, in the failed list. The completion is
+		// allowed to throw now; the job keeps its lease, and the ordinary stall
+		// recovery is what re-delivers it.
+		if (handled) {
+			job.status = "completed";
+			await this.#driver.complete(job);
 		}
 
 		return true;
+	}
+
+	/**
+	 * Keep the driver's claim on `job` alive for as long as the handler runs.
+	 * Returns the function that stops it — always called, including when the
+	 * handler throws, so a finished job never keeps extending a lease.
+	 */
+	#startRenewing(job: Job): () => void {
+		const driver = this.#driver;
+		const every = driver.renewIntervalMs;
+		if (!driver.renew || every === undefined || every <= 0) {
+			return () => {};
+		}
+		const timer = setInterval(() => {
+			// A renewal that fails is not a reason to interrupt the handler: the
+			// job may already have been recovered, and the handler finishing is
+			// still the best outcome available.
+			void driver.renew?.(job).catch(() => {});
+		}, every);
+		// Unreffed: the handler's own promise is what holds the process open.
+		timer.unref();
+		return () => {
+			clearInterval(timer);
+		};
 	}
 
 	/**

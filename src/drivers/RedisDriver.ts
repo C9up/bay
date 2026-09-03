@@ -31,6 +31,11 @@ export interface RedisClient {
 		to: "LEFT" | "RIGHT",
 	): Promise<string | null>;
 	lrem(key: string, count: number, element: string): Promise<number>;
+	/**
+	 * Optional, like `lmove`. Present on ioredis; without it the failed list
+	 * simply keeps its entries, which is what this driver did before.
+	 */
+	ltrim?(key: string, start: number, stop: number): Promise<string>;
 	llen(key: string): Promise<number>;
 	lrange(key: string, start: number, stop: number): Promise<string[]>;
 	del(key: string): Promise<number>;
@@ -40,14 +45,49 @@ export interface RedisClient {
 
 function isValidJob(obj: unknown): obj is Job {
 	if (typeof obj !== "object" || obj === null) return false;
-	const j = obj as Record<string, unknown>;
 	return (
-		typeof j.id === "string" &&
-		typeof j.name === "string" &&
-		typeof j.attempts === "number" &&
-		typeof j.maxAttempts === "number" &&
-		typeof j.status === "string"
+		typeof Reflect.get(obj, "id") === "string" &&
+		typeof Reflect.get(obj, "name") === "string" &&
+		typeof Reflect.get(obj, "attempts") === "number" &&
+		typeof Reflect.get(obj, "maxAttempts") === "number" &&
+		typeof Reflect.get(obj, "status") === "string"
 	);
+}
+
+/**
+ * What a lease holds: the exact string pop() moved into `processing`, and the
+ * worker that moved it.
+ *
+ * The owner is what makes renewal safe. Without it a worker whose lease had
+ * already expired — its job recovered, re-popped by somebody else — would go on
+ * extending the deadline of a job it no longer had any claim on. Upstream draws
+ * the same line inside its renewal script: "Only the worker that currently owns
+ * the lease may renew it."
+ */
+interface Lease {
+	owner: string;
+	raw: string;
+}
+
+/**
+ * Read a lease back. A value written by an older version of this driver is the
+ * raw job string on its own, with no owner — still usable for the one thing
+ * `#removeFromProcessing` needs it for.
+ */
+function readLease(stored: string): { owner?: string; raw: string } {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stored);
+	} catch {
+		return { raw: stored };
+	}
+	if (typeof parsed !== "object" || parsed === null) return { raw: stored };
+	const raw = Reflect.get(parsed, "raw");
+	const owner = Reflect.get(parsed, "owner");
+	if (typeof raw !== "string" || typeof owner !== "string") {
+		return { raw: stored };
+	}
+	return { owner, raw };
 }
 
 /**
@@ -157,6 +197,23 @@ export class RedisDriver implements QueueDriver {
 			 * deployment makes, not one a version check makes for it.
 			 */
 			allowNonAtomicPop?: boolean;
+			/**
+			 * How many times a job may be reclaimed from a stalled worker before
+			 * it is filed as failed instead of pushed round again. Default `1`,
+			 * upstream's default for the same setting.
+			 *
+			 * Unbounded recovery is a job that kills its worker taking the whole
+			 * queue down with it, forever: the crash never reaches the failure
+			 * path, so `attempts` never moves and `maxAttempts` never applies.
+			 */
+			maxStalledCount?: number;
+			/**
+			 * How many failed jobs to keep. Default `1000` — the ceiling the
+			 * memory driver already had. `0` keeps every one of them.
+			 *
+			 * Only enforced when the client answers `ltrim`.
+			 */
+			maxFailedJobs?: number;
 		},
 	) {
 		this.#source = source;
@@ -183,11 +240,40 @@ export class RedisDriver implements QueueDriver {
 			);
 		}
 		this.#visibilityTimeout = visibilityTimeout;
+
+		const maxStalled = options?.maxStalledCount ?? 1;
+		if (!Number.isInteger(maxStalled) || maxStalled < 0) {
+			throw new Error(
+				`[bay] RedisDriver maxStalledCount must be a non-negative integer, got ${maxStalled}`,
+			);
+		}
+		this.#maxStalledCount = maxStalled;
+
+		const maxFailed = options?.maxFailedJobs ?? 1000;
+		if (!Number.isInteger(maxFailed) || maxFailed < 0) {
+			throw new Error(
+				`[bay] RedisDriver maxFailedJobs must be a non-negative integer, got ${maxFailed}`,
+			);
+		}
+		this.#maxFailedJobs = maxFailed;
+	}
+
+	/**
+	 * Renew a lease at half its length: two chances to be heard before the
+	 * deadline, so one slow round-trip does not hand a running job to somebody
+	 * else. Read by `QueueManager` while a handler runs.
+	 */
+	get renewIntervalMs(): number {
+		return Math.max(1, Math.floor(this.#visibilityTimeout / 2));
 	}
 
 	#pendingKey = () => `${this.#prefix}pending`;
 	#processingKey = () => `${this.#prefix}processing`;
 	#allowNonAtomicPop = false;
+	#maxStalledCount = 1;
+	#maxFailedJobs = 1000;
+	/** This driver instance, as a lease owner. */
+	#workerId = crypto.randomUUID();
 	#failedKey = () => `${this.#prefix}failed`;
 	#leaseKey = (jobId: string) => `${this.#prefix}lease:${jobId}`;
 
@@ -239,11 +325,31 @@ export class RedisDriver implements QueueDriver {
 		// pending — so the delivery guarantee survives the blip.
 		await client.set(
 			this.#leaseKey(parsed.id),
-			raw,
+			JSON.stringify({ owner: this.#workerId, raw } satisfies Lease),
 			"PX",
 			String(this.#visibilityTimeout),
 		);
 		return parsed;
+	}
+
+	/**
+	 * Say the job is still being worked on, and push its deadline back.
+	 *
+	 * Answers `false` when there is nothing left to renew — the lease expired
+	 * and the job was recovered, or it was recovered and re-popped by another
+	 * worker, whose claim this one must not extend.
+	 */
+	async renew(job: Job): Promise<boolean> {
+		const client = await this.#client();
+		const key = this.#leaseKey(job.id);
+		const stored = await client.get(key);
+		if (stored === null) return false;
+		const lease = readLease(stored);
+		if (lease.owner !== undefined && lease.owner !== this.#workerId) {
+			return false;
+		}
+		await client.set(key, stored, "PX", String(this.#visibilityTimeout));
+		return true;
 	}
 
 	async complete(job: Job): Promise<void> {
@@ -258,7 +364,7 @@ export class RedisDriver implements QueueDriver {
 		await client.del(this.#leaseKey(job.id));
 		job.error = error;
 		job.status = "failed";
-		await client.rpush(this.#failedKey(), JSON.stringify(job));
+		await this.#pushFailed(client, job);
 	}
 
 	async retry(job: Job): Promise<void> {
@@ -288,14 +394,55 @@ export class RedisDriver implements QueueDriver {
 				continue;
 			}
 			const lease = await client.get(this.#leaseKey(parsed.id));
-			if (lease === null) {
-				await client.lrem(this.#processingKey(), 1, raw);
-				parsed.status = "pending";
-				await client.rpush(this.#pendingKey(), JSON.stringify(parsed));
-				recovered++;
+			if (lease !== null) continue;
+
+			// The LREM is the claim, and its RESULT decides who acts. Two
+			// recovery passes overlapping — two workers, or one worker whose
+			// pass ran long — both read the same expired entry, and both used to
+			// push it back to pending: one job, delivered twice, from the
+			// mechanism that exists to make delivery reliable. Exactly one LREM
+			// can remove a given element, so exactly one pass continues past
+			// here. (A crash between this and the RPUSH below still loses the
+			// entry; closing that needs the whole pass in one server-side script,
+			// which is how upstream does it.)
+			const claimed = await client.lrem(this.#processingKey(), 1, raw);
+			if (claimed === 0) continue;
+
+			// A stall is not an attempt: the worker died before the handler
+			// could fail, so `attempts` never moved and `maxAttempts` never
+			// applied. A job that kills whatever picks it up was therefore
+			// recovered forever, taking the queue with it. Counted separately,
+			// and bounded — upstream bounds the same thing with the same
+			// default, failing the job once it is exceeded.
+			const stalled = (parsed.stalledCount ?? 0) + 1;
+			if (stalled > this.#maxStalledCount) {
+				parsed.stalledCount = stalled;
+				parsed.status = "failed";
+				parsed.error = `Stalled ${stalled} time(s) without completing (maxStalledCount ${this.#maxStalledCount})`;
+				await this.#pushFailed(client, parsed);
+				continue;
 			}
+
+			parsed.stalledCount = stalled;
+			parsed.status = "pending";
+			await client.rpush(this.#pendingKey(), JSON.stringify(parsed));
+			recovered++;
 		}
 		return recovered;
+	}
+
+	/**
+	 * File a job as failed, keeping the list to `maxFailedJobs`.
+	 *
+	 * Unbounded, the failed list is a leak with no ceiling and no owner: nothing
+	 * trims it, and `failed()` reads all of it in one LRANGE. The memory driver
+	 * has capped its own at a thousand from the start; this is the same cap on
+	 * the driver where the list actually survives a restart.
+	 */
+	async #pushFailed(client: RedisClient, job: Job): Promise<void> {
+		await client.rpush(this.#failedKey(), JSON.stringify(job));
+		if (this.#maxFailedJobs === 0 || !client.ltrim) return;
+		await client.ltrim(this.#failedKey(), -this.#maxFailedJobs, -1);
 	}
 
 	/**
@@ -303,15 +450,16 @@ export class RedisDriver implements QueueDriver {
 	 * Redis is whatever pop() pushed, but QueueManager mutates `job` after
 	 * pop returns (attempts++, status="processing", processedAt, then
 	 * completed/failed/pending). LREM-ing on `JSON.stringify(job)` would
-	 * therefore miss every real-world entry. Use the lease — set to the
-	 * exact raw string at pop() time — and fall back to a list scan when
+	 * therefore miss every real-world entry. Use the lease — which carries
+	 * the exact raw string pop() moved — and fall back to a list scan when
 	 * the lease has expired (e.g. recoverStale already handled it).
 	 */
 	async #removeFromProcessing(job: Job): Promise<void> {
 		const client = await this.#client();
 		const stored = await client.get(this.#leaseKey(job.id));
 		if (stored !== null) {
-			const removed = await client.lrem(this.#processingKey(), 1, stored);
+			const { raw } = readLease(stored);
+			const removed = await client.lrem(this.#processingKey(), 1, raw);
 			if (removed > 0) return;
 		}
 		// Lease missing or already-LREM'd entry not found — best-effort scan
@@ -324,7 +472,7 @@ export class RedisDriver implements QueueDriver {
 			} catch {
 				continue;
 			}
-			if (isValidJob(parsed) && (parsed as { id: string }).id === job.id) {
+			if (isValidJob(parsed) && parsed.id === job.id) {
 				await client.lrem(this.#processingKey(), 1, item);
 				return;
 			}

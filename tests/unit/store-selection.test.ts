@@ -3,12 +3,14 @@ import BayProvider, { type BayProviderConfig } from "../../src/BayProvider.js";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { QueueManager } from "../../src/QueueManager.js";
-import { stores } from "../../src/stores.js";
+import { drivers, stores } from "../../src/adapters.js";
 
 /**
- * `{ default, stores }` — the shape a package takes when several backends are
+ * `{ default, adapters }` — the shape a package takes when several backends are
  * declared and one is selected, so a deployment names its queue in the
- * environment instead of building the manager by hand.
+ * environment instead of building the manager by hand. The tests below use the
+ * older `stores` spelling on purpose: it is still accepted, and a config
+ * written against it must keep selecting the backend it named.
  */
 function managerFrom(config: BayProviderConfig | undefined): QueueManager {
 	const bindings = new Map<unknown, () => unknown>();
@@ -75,10 +77,10 @@ describe("bay > store selection", () => {
 		expect(managerFrom(undefined)).toBeInstanceOf(QueueManager);
 	});
 
-	it("points a non-memory `driver` at the stores form", () => {
+	it("points a non-memory `driver` at the adapters form", () => {
 		expect(() =>
 			managerFrom({ driver: "redis" as BayProviderConfig["driver"] }),
-		).toThrow(/name it under `stores`/);
+		).toThrow(/name it under `adapters`/);
 	});
 
 	it("hands each factory its options", () => {
@@ -109,5 +111,46 @@ describe("bay > store selection", () => {
 		// but unbooted, from bay's bridge when the package is absent. Either way
 		// it reaches the caller instead of being swallowed.
 		await expect(driver.size()).rejects.toThrow();
+	});
+});
+
+describe("bay > the names upstream uses", () => {
+	it("selects through `adapters` and `drivers`", async () => {
+		const manager = managerFrom({
+			default: "memory",
+			adapters: { memory: drivers.memory() },
+		});
+
+		await manager.dispatch("job", {});
+		expect(await manager.size()).toBe(1);
+	});
+
+	it("prefers `adapters` when a config carries both", () => {
+		let fromStores = 0;
+		managerFrom({
+			default: "memory",
+			adapters: { memory: () => new MemoryDriver() },
+			stores: {
+				memory: () => {
+					fromStores++;
+					return new MemoryDriver();
+				},
+			},
+		});
+
+		expect(fromStores).toBe(0);
+	});
+
+	it("names the key the config actually used when it complains", () => {
+		expect(() =>
+			managerFrom({ default: "redis", adapters: { memory: drivers.memory() } }),
+		).toThrow(/not in `adapters`/);
+		expect(() =>
+			managerFrom({ default: "redis", stores: { memory: drivers.memory() } }),
+		).toThrow(/not in `stores`/);
+	});
+
+	it("is one namespace under two names", () => {
+		expect(stores).toBe(drivers);
 	});
 });

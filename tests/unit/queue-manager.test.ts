@@ -358,3 +358,56 @@ describe("bay > stopping a worker whose job blew up", () => {
 		stderr.mockRestore();
 	});
 });
+
+describe("bay > a completion that cannot be written", () => {
+	it("does not run the handler a second time", async () => {
+		const driver = new CapturingDriver();
+		let runs = 0;
+		const failing: QueueDriver = {
+			...driver,
+			push: (job) => driver.push(job),
+			pop: () => driver.pop(),
+			fail: (job, error) => driver.fail(job, error),
+			retry: (job) => driver.retry(job),
+			failed: () => driver.failed(),
+			size: () => driver.size(),
+			async complete() {
+				throw new Error("redis went away");
+			},
+		};
+		const queue = new QueueManager(failing);
+		queue.register("charge", {
+			async handle() {
+				runs++;
+			},
+		});
+
+		await queue.dispatch("charge", { amount: 100 });
+		// The completion write fails, and says so. It used to be caught by the
+		// handler's own catch: the job went round again, the card was charged a
+		// second time, and once `attempts` ran out the job was filed as failed
+		// with the driver's error on it — a job that had succeeded every time.
+		await expect(queue.processOne()).rejects.toThrow(/redis went away/);
+		await queue.processOne();
+
+		expect(runs).toBe(1);
+		expect(driver.retried).toHaveLength(0);
+		expect(driver.failedList).toHaveLength(0);
+	});
+
+	it("still fails a job whose handler threw", async () => {
+		const driver = new CapturingDriver();
+		const queue = new QueueManager(driver);
+		queue.register("boom", {
+			async handle() {
+				throw new Error("handler said no");
+			},
+		});
+
+		await queue.dispatch("boom", {}, { maxAttempts: 1 });
+		await queue.processOne();
+
+		expect(driver.completed).toHaveLength(0);
+		expect(driver.failArgs[0]?.error).toBe("handler said no");
+	});
+});

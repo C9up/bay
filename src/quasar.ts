@@ -3,7 +3,7 @@
  *
  * Bay does not depend on quasar: it is an optional peer, and this module
  * never imports it statically. The specifier is built at runtime so the
- * TypeScript build stays free of it too — a hard type import would make echo
+ * TypeScript build stays free of it too — a hard type import would make bay
  * unbuildable for anyone who queues in memory.
  *
  * The shape is checked before use rather than asserted, the same way bay

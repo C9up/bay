@@ -1,8 +1,8 @@
+import type { AdapterFactory } from "./adapters.js";
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
 import type { QueueDriver } from "./QueueManager.js";
 import { QueueManager } from "./QueueManager.js";
 import { clearQueue, getQueue, setQueue } from "./services/main.js";
-import type { QueueStoreFactory } from "./stores.js";
 
 /**
  * Slim, duck-typed host context — bay stays publishable without
@@ -24,20 +24,27 @@ export interface BayAppContext {
 
 export interface BayProviderConfig {
 	/**
-	 * Which named store to use — a key of {@link stores}. Read from the
+	 * Which named adapter to use — a key of {@link adapters}. Read from the
 	 * environment in the generated config, so a deployment picks its queue
 	 * backend without editing a file.
 	 */
 	default?: string;
 	/**
-	 * The queue stores this application can use, by name. Each is a factory
-	 * from `stores.*`, built only when it is the one selected.
+	 * The queue adapters this application can use, by name. Each is a factory
+	 * from `drivers.*`, built only when it is the one selected.
 	 */
-	stores?: Record<string, QueueStoreFactory>;
+	adapters?: Record<string, AdapterFactory>;
 	/**
-	 * The single-store form, kept for configs written against it: only
-	 * `"memory"` was ever accepted. Prefer `default` + `stores`, which is how a
-	 * pluggable backend is configured everywhere else and what lets the
+	 * The name this key had before it matched upstream's. Read when `adapters`
+	 * is absent, so a config written against the older spelling keeps selecting
+	 * the backend it named — silently falling back to an in-process queue is the
+	 * one outcome `buildDriver` exists to prevent.
+	 */
+	stores?: Record<string, AdapterFactory>;
+	/**
+	 * The single-adapter form, kept for configs written against it: only
+	 * `"memory"` was ever accepted. Prefer `default` + `adapters`, which is how
+	 * a pluggable backend is configured everywhere else and what lets the
 	 * environment choose.
 	 */
 	driver?: "memory";
@@ -75,35 +82,39 @@ export interface BayProviderConfig {
  * queue would only find out when a restart dropped every pending job.
  */
 function buildDriver(config: BayProviderConfig | undefined): QueueDriver {
-	const stores = config?.stores;
+	// `adapters` first, `stores` when it is absent: the key was renamed to the
+	// one upstream reads, and a config that still says `stores` must keep
+	// selecting its backend rather than quietly landing on memory.
+	const adapters = config?.adapters ?? config?.stores;
+	const key = config?.adapters ? "adapters" : "stores";
 	const name = config?.default;
 
-	if (stores && name !== undefined) {
-		const selected = stores[name];
+	if (adapters && name !== undefined) {
+		const selected = adapters[name];
 		if (!selected) {
-			const known = Object.keys(stores);
+			const known = Object.keys(adapters);
 			throw new Error(
-				`[bay] config.queue names the store '${name}', which is not in \`stores\`. ` +
+				`[bay] config.queue names the adapter '${name}', which is not in \`${key}\`. ` +
 					(known.length > 0
 						? `Declared: ${known.join(", ")}.`
-						: "`stores` is empty — declare one with stores.memory() or stores.redis()."),
+						: `\`${key}\` is empty — declare one with drivers.memory() or drivers.redis().`),
 			);
 		}
 		return selected();
 	}
 
-	if (stores && name === undefined) {
+	if (adapters && name === undefined) {
 		throw new Error(
-			"[bay] config.queue declares `stores` but no `default` naming which one to use. " +
-				`Set default to one of: ${Object.keys(stores).join(", ")}.`,
+			`[bay] config.queue declares \`${key}\` but no \`default\` naming which one to use. ` +
+				`Set default to one of: ${Object.keys(adapters).join(", ")}.`,
 		);
 	}
 
 	const driverName = config?.driver ?? "memory";
 	if (driverName !== "memory") {
 		throw new Error(
-			`[bay] Unsupported driver '${driverName}' — name it under \`stores\` instead: ` +
-				"stores: { redis: stores.redis({ connection: 'main' }) }.",
+			`[bay] Unsupported driver '${driverName}' — name it under \`adapters\` instead: ` +
+				"adapters: { redis: drivers.redis({ connection: 'main' }) }.",
 		);
 	}
 	return new MemoryDriver();
