@@ -40,6 +40,13 @@ export default defineConfig({
     memory: drivers.memory(),
     redis: drivers.redis({ connection: 'main' }),
   },
+
+  // What the worker does between jobs: how long it waits after finding
+  // nothing, and how often it reclaims jobs a crashed worker left behind.
+  worker: {
+    idleDelay: 2_000,
+    stalledInterval: 30_000,
+  },
 })`,
 	);
 }

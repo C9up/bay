@@ -50,7 +50,7 @@ describe("FakeQueue — QueueDriver surface", () => {
 		expect(typeof captured.processedAt).toBe("number");
 	});
 
-	it("retry increments attempts, resets to pending, clears error/processedAt", async () => {
+	it("retry resets to pending and clears error/processedAt, leaving attempts alone", async () => {
 		const q = new FakeQueue();
 		const job = makeJob({
 			id: "job_3",
@@ -62,7 +62,9 @@ describe("FakeQueue — QueueDriver surface", () => {
 		await q.push(job);
 		await q.retry(job);
 		const captured = q.getPushed()[0];
-		expect(captured.attempts).toBe(2);
+		// The worker owns this counter — `processOne` has already incremented it
+		// by the time a driver sees the job, and neither real driver adds to it.
+		expect(captured.attempts).toBe(1);
 		expect(captured.status).toBe("pending");
 		// M2 review fix: a pending job carrying a stale `error` string
 		// and `processedAt` violates the Job state-machine invariant.

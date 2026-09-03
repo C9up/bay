@@ -1,7 +1,7 @@
 import type { AdapterFactory } from "./adapters.js";
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
 import type { QueueDriver } from "./QueueManager.js";
-import { QueueManager } from "./QueueManager.js";
+import { QueueManager, type WorkerOptions } from "./QueueManager.js";
 import { clearQueue, getQueue, setQueue } from "./services/main.js";
 
 /**
@@ -48,6 +48,11 @@ export interface BayProviderConfig {
 	 * environment choose.
 	 */
 	driver?: "memory";
+	/**
+	 * Defaults for the worker `queue.work()` starts — upstream's `worker` block,
+	 * by the names it gives them. An argument to `work()` still wins.
+	 */
+	worker?: WorkerOptions;
 }
 
 /**
@@ -126,7 +131,7 @@ export default class BayProvider {
 	register(): void {
 		this.app.container.singleton(QueueManager, () => {
 			const config = this.app.config.get<BayProviderConfig>("queue");
-			return new QueueManager(buildDriver(config));
+			return new QueueManager(buildDriver(config), config?.worker);
 		});
 		this.app.container.singleton("queue", () =>
 			this.app.container.resolve<QueueManager>(QueueManager),

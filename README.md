@@ -51,7 +51,16 @@ import queue from '@c9up/bay/services/main'
 
 queue.register('send-email', new SendEmailJob())
 await queue.dispatch('send-email', { to: 'user@example.com' })
+
+// A worker, with the config's `worker` block as its defaults.
+await queue.work()
 ```
+
+The `worker` block carries the framework's names for what a worker does between
+jobs — `idleDelay` (how long it waits after finding nothing, 2 s) and
+`stalledInterval` (how often it reclaims what a crashed worker left behind,
+30 s). An argument to `work()` beats the block, and the block beats the
+defaults.
 
 | Adapter | Keeps jobs | Use it when |
 | --- | --- | --- |

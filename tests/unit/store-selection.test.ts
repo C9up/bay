@@ -154,3 +154,33 @@ describe("bay > the names upstream uses", () => {
 		expect(stores).toBe(drivers);
 	});
 });
+
+describe("bay > the worker block", () => {
+	it("reaches the manager the provider builds", async () => {
+		const manager = managerFrom({
+			default: "memory",
+			adapters: { memory: drivers.memory() },
+			worker: { stalledInterval: 0 },
+		});
+
+		// A `stalledInterval` the manager refuses is the observable proof it read
+		// the block: nothing else would make `work()` reject.
+		await expect(manager.work()).rejects.toThrow(
+			/stalledInterval must be positive/,
+		);
+	});
+
+	it("lets an argument to work() beat the block", async () => {
+		const manager = managerFrom({
+			default: "memory",
+			adapters: { memory: drivers.memory() },
+			worker: { stalledInterval: 0 },
+		});
+
+		const running = manager.work({ idleDelay: 5, stalledInterval: 50 });
+		await manager.stop();
+		await running;
+
+		expect(await manager.size()).toBe(0);
+	});
+})

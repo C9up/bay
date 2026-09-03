@@ -32,6 +32,17 @@ export interface JobHandler {
 	handle(payload: unknown): Promise<void>;
 }
 
+/**
+ * What a worker is told before it starts, by upstream's names for it
+ * (`WorkerConfig.idleDelay`, `WorkerConfig.stalledInterval`).
+ */
+export interface WorkerOptions {
+	/** Milliseconds to wait after finding nothing to do. Default `2000`. */
+	idleDelay?: number;
+	/** Milliseconds between stalled-job sweeps. Default `30_000`. */
+	stalledInterval?: number;
+}
+
 export interface QueueDriver {
 	push(job: Job): Promise<void>;
 	pop(): Promise<Job | null>;
@@ -70,8 +81,12 @@ export class QueueManager {
 	#wake: (() => void) | undefined;
 	#inflightPromise: Promise<boolean> | null = null;
 
-	constructor(driver: QueueDriver) {
+	/** Defaults for `work()`, from the config's `worker` block. */
+	readonly #workerDefaults: WorkerOptions;
+
+	constructor(driver: QueueDriver, workerDefaults?: WorkerOptions) {
 		this.#driver = driver;
+		this.#workerDefaults = workerDefaults ?? {};
 	}
 
 	/** Register a job handler. */
@@ -194,22 +209,50 @@ export class QueueManager {
 
 	/**
 	 * Start processing jobs continuously. Reclaims crash-orphaned jobs at
-	 * startup and every `recoverStaleMs` thereafter (no-op for in-memory drivers
-	 * without recoverStale) — otherwise a job left in 'processing' by a crashed
-	 * worker would sit there forever.
+	 * startup and every `stalledInterval` thereafter (no-op for in-memory
+	 * drivers without recoverStale) — otherwise a job left in 'processing' by a
+	 * crashed worker would sit there forever.
+	 *
+	 * The options are upstream's `worker` block, by the names it gives them:
+	 *
+	 *   queue.work({ idleDelay: 2000, stalledInterval: 30_000 })
+	 *
+	 * `idleDelay` defaults to 2 s, which is upstream's default too — a worker
+	 * that finds nothing waits before asking again, and asking every second was
+	 * bay's own number rather than the framework's.
+	 *
+	 * The positional form is the one this method had before it took the
+	 * framework's names, and still works: `work(idleDelay, stalledInterval)`.
 	 */
-	async work(pollIntervalMs = 1000, recoverStaleMs = 30_000): Promise<void> {
-		if (pollIntervalMs <= 0) {
-			throw new Error("pollIntervalMs must be positive");
+	async work(
+		options?: WorkerOptions | number,
+		stalledIntervalArg = 30_000,
+	): Promise<void> {
+		// An argument beats the config's `worker` block, which beats the
+		// framework's own defaults.
+		const defaults = this.#workerDefaults;
+		const idleDelay =
+			typeof options === "number"
+				? options
+				: (options?.idleDelay ?? defaults.idleDelay ?? 2000);
+		const stalledInterval =
+			typeof options === "number"
+				? stalledIntervalArg
+				: (options?.stalledInterval ??
+					defaults.stalledInterval ??
+					stalledIntervalArg);
+
+		if (idleDelay <= 0) {
+			throw new Error("idleDelay must be positive");
 		}
-		if (recoverStaleMs <= 0) {
-			throw new Error("recoverStaleMs must be positive");
+		if (stalledInterval <= 0) {
+			throw new Error("stalledInterval must be positive");
 		}
 		if (this.#running) {
 			throw new Error("QueueManager is already running");
 		}
 		this.#running = true;
-		const loop = this.#loop(pollIntervalMs, recoverStaleMs);
+		const loop = this.#loop(idleDelay, stalledInterval);
 		this.#loopPromise = loop;
 		try {
 			await loop;
@@ -226,23 +269,23 @@ export class QueueManager {
 	 * while the loop was still pending — up to a full poll interval of a worker
 	 * that was supposed to be gone, and a timer holding the process open.
 	 */
-	async #loop(pollIntervalMs: number, recoverStaleMs: number): Promise<void> {
+	async #loop(idleDelay: number, stalledInterval: number): Promise<void> {
 		await this.#tryRecoverStale();
 		let lastRecover = Date.now();
 		while (this.#running) {
 			try {
 				this.#inflightPromise = this.processOne();
 				const processed = await this.#inflightPromise;
-				if (!processed) await this.#sleep(pollIntervalMs);
+				if (!processed) await this.#sleep(idleDelay);
 			} catch (err) {
 				process.stderr.write(
 					`QueueManager processOne error: ${err instanceof Error ? err.message : String(err)}\n`,
 				);
-				await this.#sleep(pollIntervalMs);
+				await this.#sleep(idleDelay);
 			} finally {
 				this.#inflightPromise = null;
 			}
-			if (this.#running && Date.now() - lastRecover >= recoverStaleMs) {
+			if (this.#running && Date.now() - lastRecover >= stalledInterval) {
 				await this.#tryRecoverStale();
 				lastRecover = Date.now();
 			}

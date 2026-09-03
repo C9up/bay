@@ -61,7 +61,11 @@ export class FakeQueue implements QueueDriver {
 
 	async retry(job: Job): Promise<void> {
 		const found = this.#requireJob(job, "retry");
-		found.attempts += 1;
+		// `attempts` is the WORKER's counter, not the driver's: `processOne`
+		// increments it before it calls this, and neither real driver touches it
+		// again. Incrementing here counted the same attempt twice, so a fake
+		// exhausted `maxAttempts` in half the tries the real queue takes — a
+		// test double that disagrees with what it stands in for.
 		found.status = "pending";
 		// Reset transient state from the prior failure so a retried
 		// job's invariants match a fresh push (a real driver would

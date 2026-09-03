@@ -178,10 +178,10 @@ describe("bay > QueueManager > processOne", () => {
 });
 
 describe("bay > QueueManager > work / stop", () => {
-	it("rejects pollIntervalMs <= 0 (would busy-loop)", async () => {
+	it("rejects idleDelay <= 0 (would busy-loop)", async () => {
 		const q = new QueueManager(new CapturingDriver());
-		await expect(q.work(0)).rejects.toThrow(/pollIntervalMs must be positive/);
-		await expect(q.work(-1)).rejects.toThrow(/pollIntervalMs must be positive/);
+		await expect(q.work(0)).rejects.toThrow(/idleDelay must be positive/);
+		await expect(q.work(-1)).rejects.toThrow(/idleDelay must be positive/);
 	});
 
 	it("refuses to start a second concurrent work() loop", async () => {
@@ -409,5 +409,63 @@ describe("bay > a completion that cannot be written", () => {
 
 		expect(driver.completed).toHaveLength(0);
 		expect(driver.failArgs[0]?.error).toBe("handler said no");
+	});
+});
+
+describe("bay > the worker options carry upstream's names", () => {
+	it("takes { idleDelay, stalledInterval }", async () => {
+		const driver = new CapturingDriver();
+		const queue = new QueueManager(driver);
+		const running = queue.work({ idleDelay: 5, stalledInterval: 50 });
+		await queue.stop();
+		await running;
+
+		expect(driver.pending).toHaveLength(0);
+	});
+
+	it("rejects a stalledInterval that is not positive", async () => {
+		const queue = new QueueManager(new CapturingDriver());
+		await expect(queue.work({ stalledInterval: 0 })).rejects.toThrow(
+			/stalledInterval must be positive/,
+		);
+	});
+
+	it("still takes the positional form it had before", async () => {
+		const driver = new CapturingDriver();
+		const queue = new QueueManager(driver);
+		const running = queue.work(5, 50);
+		await queue.stop();
+		await running;
+
+		expect(driver.pending).toHaveLength(0);
+	});
+
+	it("waits upstream's two seconds when nothing says otherwise", async () => {
+		vi.useFakeTimers();
+		try {
+			const driver = new CapturingDriver();
+			const queue = new QueueManager(driver);
+			let polls = 0;
+			const pop = driver.pop.bind(driver);
+			driver.pop = async () => {
+				polls++;
+				return pop();
+			};
+
+			const running = queue.work();
+			await vi.advanceTimersByTimeAsync(1_500);
+			const afterOneAndAHalf = polls;
+			await vi.advanceTimersByTimeAsync(1_000);
+			const afterTwoAndAHalf = polls;
+
+			await queue.stop();
+			await running;
+
+			// One poll on entry, nothing at 1.5 s, a second past 2 s.
+			expect(afterOneAndAHalf).toBe(1);
+			expect(afterTwoAndAHalf).toBe(2);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
