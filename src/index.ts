@@ -12,6 +12,9 @@ export {
 	type QueueStoreFactory,
 	stores,
 } from "./adapters.js";
+
+import "./augmentations.js";
+
 export type { BayProviderConfig } from "./BayProvider.js";
 export { MemoryDriver } from "./drivers/MemoryDriver.js";
 export type { RedisClient } from "./drivers/RedisDriver.js";

@@ -1,4 +1,5 @@
 import type { AdapterFactory } from "./adapters.js";
+import "./augmentations.js";
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
 import type { QueueDriver } from "./QueueManager.js";
 import { QueueManager, type WorkerOptions } from "./QueueManager.js";
