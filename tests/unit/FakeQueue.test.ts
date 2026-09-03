@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { Job } from "../../src/QueueManager.js";
 import { FakeQueue } from "../../src/testing/FakeQueue.js";
 
+/** Narrow away null/undefined without a `!` assertion (which lies to the compiler). */
+function defined<T>(value: T | null | undefined): T {
+	if (value == null) throw new Error("expected a defined value");
+	return value;
+}
+
+
 function makeJob(overrides: Partial<Job> = {}): Job {
 	return {
 		id: overrides.id ?? `job_${Math.random().toString(36).slice(2)}`,
@@ -21,7 +28,7 @@ describe("FakeQueue — QueueDriver surface", () => {
 		const q = new FakeQueue();
 		await q.push(makeJob({ name: "send-email" }));
 		expect(q.getPushed()).toHaveLength(1);
-		expect(q.getPushed()[0].name).toBe("send-email");
+		expect(defined(q.getPushed()[0]).name).toBe("send-email");
 	});
 
 	it("pop always returns null (fakes never auto-dispatch)", async () => {
@@ -35,7 +42,7 @@ describe("FakeQueue — QueueDriver surface", () => {
 		const job = makeJob({ id: "job_1" });
 		await q.push(job);
 		await q.fail(job, "boom");
-		const captured = q.getPushed()[0];
+		const captured = defined(q.getPushed()[0]);
 		expect(captured.status).toBe("failed");
 		expect(captured.error).toBe("boom");
 	});
@@ -45,7 +52,7 @@ describe("FakeQueue — QueueDriver surface", () => {
 		const job = makeJob({ id: "job_2" });
 		await q.push(job);
 		await q.complete(job);
-		const captured = q.getPushed()[0];
+		const captured = defined(q.getPushed()[0]);
 		expect(captured.status).toBe("completed");
 		expect(typeof captured.processedAt).toBe("number");
 	});
@@ -61,7 +68,7 @@ describe("FakeQueue — QueueDriver surface", () => {
 		});
 		await q.push(job);
 		await q.retry(job);
-		const captured = q.getPushed()[0];
+		const captured = defined(q.getPushed()[0]);
 		// The worker owns this counter — `processOne` has already incremented it
 		// by the time a driver sees the job, and neither real driver adds to it.
 		expect(captured.attempts).toBe(1);
@@ -107,7 +114,7 @@ describe("FakeQueue — QueueDriver surface", () => {
 		await q.fail(a, "oops");
 		const failed = await q.failed();
 		expect(failed).toHaveLength(1);
-		expect(failed[0].id).toBe("a");
+		expect(defined(failed[0]).id).toBe("a");
 	});
 
 	it("size counts only pending jobs", async () => {
@@ -127,8 +134,8 @@ describe("FakeQueue — testing helpers", () => {
 		const q = new FakeQueue();
 		await q.push(makeJob({ name: "a" }));
 		const snapshot = q.getPushed();
-		snapshot[0].name = "mutated";
-		expect(q.getPushed()[0].name).toBe("a");
+		defined(snapshot[0]).name = "mutated";
+		expect(defined(q.getPushed()[0]).name).toBe("a");
 	});
 
 	it("reset clears the captured array", async () => {

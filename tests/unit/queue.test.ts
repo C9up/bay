@@ -2,6 +2,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { type JobHandler, QueueManager } from "../../src/QueueManager.js";
 
+/** Narrow away null/undefined without a `!` assertion (which lies to the compiler). */
+function defined<T>(value: T | null | undefined): T {
+	if (value == null) throw new Error("expected a defined value");
+	return value;
+}
+
+
 describe("queue > MemoryDriver", () => {
 	let queue: QueueManager;
 
@@ -47,8 +54,8 @@ describe("queue > MemoryDriver", () => {
 		expect(attempts).toBe(3);
 		const failed = await queue.failedJobs();
 		expect(failed).toHaveLength(1);
-		expect(failed[0].error).toBe("boom");
-		expect(failed[0].status).toBe("failed");
+		expect(defined(failed[0]).error).toBe("boom");
+		expect(defined(failed[0]).status).toBe("failed");
 	});
 
 	it("fails immediately when no handler is registered for the job name", async () => {
@@ -56,7 +63,7 @@ describe("queue > MemoryDriver", () => {
 		await queue.processOne();
 		const failed = await queue.failedJobs();
 		expect(failed).toHaveLength(1);
-		expect(failed[0].error).toContain("No handler");
+		expect(defined(failed[0]).error).toContain("No handler");
 	});
 
 	it("accepts class-based handlers", async () => {
