@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { drivers, stores } from "../../src/adapters.js";
 import BayProvider, { type BayProviderConfig } from "../../src/BayProvider.js";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { QueueManager } from "../../src/QueueManager.js";
-import { drivers, stores } from "../../src/adapters.js";
 
 /**
  * `{ default, adapters }` — the shape a package takes when several backends are
@@ -183,4 +183,4 @@ describe("bay > the worker block", () => {
 
 		expect(await manager.size()).toBe(0);
 	});
-})
+});

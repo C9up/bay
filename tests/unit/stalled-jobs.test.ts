@@ -67,10 +67,13 @@ function fakeRedis(): {
 			if (previous) clearTimeout(previous);
 			const px = args.indexOf("PX");
 			if (px < 0) return "OK";
-			const timer = setTimeout(() => {
-				keys.delete(key);
-				timers.delete(key);
-			}, Number(args[px + 1]));
+			const timer = setTimeout(
+				() => {
+					keys.delete(key);
+					timers.delete(key);
+				},
+				Number(args[px + 1]),
+			);
 			timer.unref();
 			timers.set(key, timer);
 			return "OK";

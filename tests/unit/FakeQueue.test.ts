@@ -8,7 +8,6 @@ function defined<T>(value: T | null | undefined): T {
 	return value;
 }
 
-
 function makeJob(overrides: Partial<Job> = {}): Job {
 	return {
 		id: overrides.id ?? `job_${Math.random().toString(36).slice(2)}`,
