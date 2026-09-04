@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-	type Job,
 	type JobHandler,
+	type JobRecord,
 	type QueueDriver,
 	QueueManager,
 } from "../../src/QueueManager.js";
@@ -13,30 +13,30 @@ function defined<T>(value: T | null | undefined): T {
 }
 
 class CapturingDriver implements QueueDriver {
-	pending: Job[] = [];
-	completed: Job[] = [];
-	failedList: Job[] = [];
-	retried: Job[] = [];
-	failArgs: Array<{ job: Job; error: string }> = [];
+	pending: JobRecord[] = [];
+	completed: JobRecord[] = [];
+	failedList: JobRecord[] = [];
+	retried: JobRecord[] = [];
+	failArgs: Array<{ job: JobRecord; error: string }> = [];
 
-	async push(job: Job): Promise<void> {
+	async push(job: JobRecord): Promise<void> {
 		this.pending.push(job);
 	}
-	async pop(): Promise<Job | null> {
+	async pop(): Promise<JobRecord | null> {
 		return this.pending.shift() ?? null;
 	}
-	async complete(job: Job): Promise<void> {
+	async complete(job: JobRecord): Promise<void> {
 		this.completed.push(job);
 	}
-	async fail(job: Job, error: string): Promise<void> {
+	async fail(job: JobRecord, error: string): Promise<void> {
 		this.failArgs.push({ job, error });
 		this.failedList.push(job);
 	}
-	async retry(job: Job): Promise<void> {
+	async retry(job: JobRecord): Promise<void> {
 		this.retried.push(job);
 		this.pending.push(job);
 	}
-	async failed(): Promise<Job[]> {
+	async failed(): Promise<JobRecord[]> {
 		return [...this.failedList];
 	}
 	async size(): Promise<number> {
@@ -309,14 +309,14 @@ describe("bay > stopping a worker whose job blew up", () => {
 	class FailingDriver implements QueueDriver {
 		pops = 0;
 		async push(): Promise<void> {}
-		async pop(): Promise<Job | null> {
+		async pop(): Promise<JobRecord | null> {
 			this.pops++;
 			throw new Error("driver is down");
 		}
 		async complete(): Promise<void> {}
 		async fail(): Promise<void> {}
 		async retry(): Promise<void> {}
-		async failed(): Promise<Job[]> {
+		async failed(): Promise<JobRecord[]> {
 			return [];
 		}
 		async size(): Promise<number> {

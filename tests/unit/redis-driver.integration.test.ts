@@ -13,7 +13,7 @@ import { QuasarManager } from "@c9up/quasar";
 import { clearQuasar, setQuasar } from "@c9up/quasar/services/main";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
-import type { Job } from "../../src/QueueManager.js";
+import type { JobRecord } from "../../src/QueueManager.js";
 import { quasarConnection } from "../../src/quasar.js";
 
 const url = process.env.REDIS_TEST_URL ?? "";
@@ -54,7 +54,7 @@ const connections = Object.fromEntries(
 	Array.from({ length: WORKERS }, (_, i) => [`w${i}`, { url }]),
 );
 
-function makeJob(id: string): Job {
+function makeJob(id: string): JobRecord {
 	return {
 		id,
 		name: "send-mail",
@@ -101,7 +101,7 @@ describeRedis("RedisDriver against a live Redis", () => {
 			Array.from({ length: WORKERS }, (_, i) => driver(i).pop()),
 		);
 
-		const got = popped.filter((job): job is Job => job !== null);
+		const got = popped.filter((job): job is JobRecord => job !== null);
 		expect(got).toHaveLength(1);
 		expect(got[0]?.id).toBe("only-once");
 	});

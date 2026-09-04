@@ -1,0 +1,111 @@
+/**
+ * Finding the job classes an application wrote.
+ *
+ * A job class carries its own name, and a worker resolves a queued record by
+ * that name — so the worker process has to have imported the class. Written by
+ * hand that is a registration list to keep in step with a directory:
+ *
+ *     queue.registerJob(SendEmail)
+ *     queue.registerJob(SendInvoice)   // …and the one nobody added
+ *
+ * `locations` in `config/queue.ts` is the directory instead. Every module under
+ * it is imported once at boot, and a default export that is a job class is
+ * registered under its own name.
+ *
+ * Directories, not globs. `'./app/jobs/**\/*.{ts,js}'` — the spelling upstream's
+ * config uses — is accepted and read as the directory it starts with, so a
+ * config copied from there works; bay ships no glob engine and adding a
+ * dependency for one path shape is not worth it.
+ */
+
+import * as fsp from "node:fs/promises";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { isJobClass, type JobClass } from "./Job.js";
+
+/** Where `make:job` writes, and where discovery looks when nothing is declared. */
+export const DEFAULT_JOBS_DIR = "app/jobs";
+
+let jobsDir = DEFAULT_JOBS_DIR;
+
+/** @internal Told by the provider what the config declared. */
+export function setJobsDir(dir: string): void {
+	jobsDir = dir;
+}
+
+/** Where job files live — the first `locations` entry, or the default. */
+export function getJobsDir(): string {
+	return jobsDir;
+}
+
+/**
+ * The directory a `locations` entry names.
+ *
+ * Everything from the first glob character on is dropped: `app/jobs/** /*.ts`
+ * and `app/jobs` name the same directory, and the walk below is recursive
+ * either way.
+ */
+export function directoryOf(location: string): string {
+	const withoutGlob = location.split(/[*?[{]/)[0] ?? location;
+	const trimmed = withoutGlob.replace(/\/+$/, "");
+	return trimmed.replace(/^\.\//, "") || ".";
+}
+
+/** Every module file under `dir`, recursively. */
+async function walk(dir: string, depth = 0): Promise<string[]> {
+	// A jobs directory is a flat convention with the occasional subdirectory;
+	// an unbounded walk would follow whatever happens to live under it.
+	if (depth > 8) return [];
+	let entries: import("node:fs").Dirent[];
+	try {
+		entries = await fsp.readdir(dir, { withFileTypes: true });
+	} catch {
+		// A declared directory that does not exist yet is not an error: a project
+		// can name where its jobs will go before writing the first one.
+		return [];
+	}
+	const found: string[] = [];
+	for (const entry of entries) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			found.push(...(await walk(full, depth + 1)));
+			continue;
+		}
+		// `.d.ts` is a declaration, not a module with a job in it.
+		if (/\.d\.[cm]?ts$/.test(entry.name)) continue;
+		if (/\.[cm]?[jt]s$/.test(entry.name)) found.push(full);
+	}
+	return found.sort();
+}
+
+/**
+ * Import every module under `locations` and return the job classes they
+ * default-export.
+ *
+ * A module that throws on import is reported and skipped: one unfinished job
+ * file must not stop the worker from running every other job.
+ */
+export async function discoverJobs(
+	locations: readonly string[],
+): Promise<JobClass[]> {
+	const found: JobClass[] = [];
+	for (const location of locations) {
+		for (const file of await walk(directoryOf(location))) {
+			let module: unknown;
+			try {
+				module = await import(pathToFileURL(path.resolve(file)).href);
+			} catch (err) {
+				process.stderr.write(
+					`[bay] could not load '${file}': ${
+						err instanceof Error ? err.message : String(err)
+					}\n`,
+				);
+				continue;
+			}
+			if (typeof module !== "object" || module === null) continue;
+			const exported = Reflect.get(module, "default");
+			if (isJobClass(exported)) found.push(exported);
+		}
+	}
+	return found;
+}

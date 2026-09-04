@@ -45,22 +45,84 @@ The keys are the framework's: `default` + `adapters`, filled from a `drivers`
 namespace, selected by `QUEUE_DRIVER`. Bay used to say `stores` / `QUEUE_STORE`;
 both names still resolve, so an existing `config/queue.ts` keeps working.
 
+## A job is a class
+
 ```ts
-// start/queue.ts
-import queue from '@c9up/bay/services/main'
+// app/jobs/send_email.ts  —  ream make:job SendEmail
+import { Job } from '@c9up/bay'
+import type { JobOptions } from '@c9up/bay'
 
-queue.register('send-email', new SendEmailJob())
-await queue.dispatch('send-email', { to: 'user@example.com' })
+export default class SendEmail extends Job<{ to: string }> {
+  static options: JobOptions = {
+    queue: 'emails',   // which queue it waits in
+    maxRetries: 5,     // how many times the handler may run
+    delay: '10s',      // hold it before any worker may take it
+    timeout: '1m',     // how long the handler gets
+  }
 
-// A worker, with the config's `worker` block as its defaults.
-await queue.work()
+  async execute() {
+    await mail.send(this.payload.to)
+  }
+
+  async failed(error: Error) {
+    // Once the last attempt has failed — the alert, not the retry.
+  }
+}
 ```
 
+```ts
+import queue from '@c9up/bay/services/main'
+
+await queue.dispatch(SendEmail, { to: 'user@example.com' })
+```
+
+The class carries its own name, its options and the type of the payload it
+reads, so a field the handler reads cannot be one the dispatcher never sent. The
+call site overrides any of them: `dispatch(SendEmail, payload, { queue: 'critical' })`.
+
+Registering by name still works, and is what a job whose name is computed at
+runtime needs:
+
+```ts
+queue.register('send-email', new SendEmailHandler())
+await queue.dispatch('send-email', { to: 'user@example.com' })
+```
+
+## Workers
+
+```bash
+ream queue:work                                  # the default queue, one at a time
+ream queue:work --queue=critical,default         # in that order of preference
+ream queue:work --concurrency=10                 # ten in flight
+```
+
+```ts
+// or in process
+await queue.work({ queues: ['emails'], concurrency: 4 })
+```
+
+Naming the queues is what keeps a slow one from starving a fast one: run a
+worker for `emails` and another for `default` rather than one worker taking
+whatever comes. `concurrency` is one by default, which is safe and a poor
+default for anything that waits on the network.
+
+A `timeout` fails the attempt; it does not kill the handler, because nothing in
+Node can interrupt a running promise. What it buys is that the **worker** stops
+waiting — otherwise one stuck job costs the whole worker, which never picks
+anything up again.
+
 The `worker` block carries the framework's names for what a worker does between
-jobs — `idleDelay` (how long it waits after finding nothing, 2 s) and
+jobs — `idleDelay` (how long it waits after finding nothing, 2 s),
 `stalledInterval` (how often it reclaims what a crashed worker left behind,
-30 s). An argument to `work()` beats the block, and the block beats the
-defaults.
+30 s), `concurrency` and `queues`. An argument to `work()` beats the block, and
+the block beats the defaults.
+
+`locations` says where the job classes live (`['app/jobs']` by default). Every
+module under them is imported at boot and a default export that is a job class
+is registered under its own name — which is what lets a **worker** process
+resolve a record queued by an **HTTP** one. Without it the registration list is
+a directory kept in step by hand, and the job nobody added to it fails as "no
+handler registered".
 
 | Adapter | Keeps jobs | Use it when |
 | --- | --- | --- |

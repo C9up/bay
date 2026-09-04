@@ -1,9 +1,11 @@
 /**
  * @c9up/bay — Background job queue for the Ream framework.
  *
- * Dispatch/process/retry/fail pattern with pluggable drivers (Memory, Redis).
+ * A job is a class: it carries its own name, its options and the type of the
+ * payload it reads, and `dispatch(SomeJob, payload)` takes it. Named queues,
+ * `delay`, `timeout` and worker `concurrency` come from the same declaration.
  *
- * @implements MISS-11
+ * Dispatch/process/retry/fail, with pluggable drivers (Memory, Redis).
  */
 
 export {
@@ -19,8 +21,22 @@ export type { BayProviderConfig } from "./BayProvider.js";
 export { MemoryDriver } from "./drivers/MemoryDriver.js";
 export type { RedisClient } from "./drivers/RedisDriver.js";
 export { RedisDriver } from "./drivers/RedisDriver.js";
-export type { Job, JobHandler, QueueDriver } from "./QueueManager.js";
-export { QueueManager } from "./QueueManager.js";
+export {
+	DEFAULT_QUEUE,
+	type Duration,
+	isJobClass,
+	Job,
+	type JobClass,
+	type JobOptions,
+} from "./Job.js";
+export type {
+	DispatchOptions,
+	JobHandler,
+	JobRecord,
+	QueueDriver,
+	WorkerOptions,
+} from "./QueueManager.js";
+export { QueueManager, queueOf } from "./QueueManager.js";
 
 import type { BayProviderConfig } from "./BayProvider.js";
 

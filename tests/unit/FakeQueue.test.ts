@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Job } from "../../src/QueueManager.js";
+import type { JobRecord } from "../../src/QueueManager.js";
 import { FakeQueue } from "../../src/testing/FakeQueue.js";
 
 /** Narrow away null/undefined without a `!` assertion (which lies to the compiler). */
@@ -8,7 +8,7 @@ function defined<T>(value: T | null | undefined): T {
 	return value;
 }
 
-function makeJob(overrides: Partial<Job> = {}): Job {
+function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
 	return {
 		id: overrides.id ?? `job_${Math.random().toString(36).slice(2)}`,
 		name: overrides.name ?? "send-email",
@@ -73,7 +73,7 @@ describe("FakeQueue — QueueDriver surface", () => {
 		expect(captured.attempts).toBe(1);
 		expect(captured.status).toBe("pending");
 		// M2 review fix: a pending job carrying a stale `error` string
-		// and `processedAt` violates the Job state-machine invariant.
+		// and `processedAt` violates the job state-machine invariant.
 		expect(captured.error).toBeUndefined();
 		expect(captured.processedAt).toBeUndefined();
 	});

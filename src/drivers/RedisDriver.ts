@@ -18,8 +18,9 @@
  * needs a thin adapter.
  */
 
+import { DEFAULT_QUEUE } from "../Job.js";
 import { inProduction } from "../nodeEnv.js";
-import type { Job, QueueDriver } from "../QueueManager.js";
+import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
 
 export interface RedisClient {
 	rpush(key: string, ...values: string[]): Promise<number>;
@@ -41,9 +42,24 @@ export interface RedisClient {
 	del(key: string): Promise<number>;
 	set(key: string, value: string, ...args: string[]): Promise<string | null>;
 	get(key: string): Promise<string | null>;
+	/**
+	 * Sorted-set commands, for delayed jobs. Optional like `lmove`: a client
+	 * without them can still run a queue, and `push` refuses a job carrying a
+	 * `delay` rather than running it early — which is the one thing a delay
+	 * must not do.
+	 */
+	zadd?(key: string, score: number, member: string): Promise<number | string>;
+	zrangebyscore?(
+		key: string,
+		min: number | string,
+		max: number | string,
+		...args: string[]
+	): Promise<string[]>;
+	zrem?(key: string, ...members: string[]): Promise<number>;
+	zcard?(key: string): Promise<number>;
 }
 
-function isValidJob(obj: unknown): obj is Job {
+function isValidJob(obj: unknown): obj is JobRecord {
 	if (typeof obj !== "object" || obj === null) return false;
 	return (
 		typeof Reflect.get(obj, "id") === "string" &&
@@ -267,7 +283,22 @@ export class RedisDriver implements QueueDriver {
 		return Math.max(1, Math.floor(this.#visibilityTimeout / 2));
 	}
 
-	#pendingKey = () => `${this.#prefix}pending`;
+	/**
+	 * Where one queue's jobs wait.
+	 *
+	 * The default queue keeps the key it always had. Naming it
+	 * `queue:default:pending` would have been tidier and would have orphaned
+	 * every job already sitting in `queue:pending` at the moment of the upgrade
+	 * — a silent loss, since nothing reads the old key afterwards.
+	 */
+	#pendingKey = (queue: string = DEFAULT_QUEUE) =>
+		queue === DEFAULT_QUEUE
+			? `${this.#prefix}pending`
+			: `${this.#prefix}q:${queue}:pending`;
+	#delayedKey = (queue: string = DEFAULT_QUEUE) =>
+		queue === DEFAULT_QUEUE
+			? `${this.#prefix}delayed`
+			: `${this.#prefix}q:${queue}:delayed`;
 	#processingKey = () => `${this.#prefix}processing`;
 	#allowNonAtomicPop = false;
 	#maxStalledCount = 1;
@@ -277,25 +308,39 @@ export class RedisDriver implements QueueDriver {
 	#failedKey = () => `${this.#prefix}failed`;
 	#leaseKey = (jobId: string) => `${this.#prefix}lease:${jobId}`;
 
-	async push(job: Job): Promise<void> {
+	async push(job: JobRecord): Promise<void> {
 		const client = await this.#client();
-		await client.rpush(this.#pendingKey(), JSON.stringify(job));
+		const queue = queueOf(job);
+		if (job.runAt !== undefined && job.runAt > Date.now()) {
+			if (!client.zadd) {
+				// Pushing it to the list instead would run it now, which is the
+				// one thing a delay exists to prevent.
+				throw new Error(
+					"This Redis client cannot hold a delayed job: it has no ZADD. " +
+						"Use a client with sorted-set commands (ioredis has them), or dispatch without `delay`.",
+				);
+			}
+			await client.zadd(
+				this.#delayedKey(queue),
+				job.runAt,
+				JSON.stringify(job),
+			);
+			return;
+		}
+		await client.rpush(this.#pendingKey(queue), JSON.stringify(job));
 	}
 
-	async pop(): Promise<Job | null> {
+	async pop(
+		queues: readonly string[] = [DEFAULT_QUEUE],
+	): Promise<JobRecord | null> {
 		const client = await this.#client();
 		let raw: string | null = null;
 
-		if (client.lmove) {
-			raw = await client.lmove(
-				this.#pendingKey(),
-				this.#processingKey(),
-				"LEFT",
-				"RIGHT",
-			);
-		} else {
-			raw = await client.lpop(this.#pendingKey());
-			if (raw) await client.rpush(this.#processingKey(), raw);
+		// In the order given, so a worker can say which queue it drains first.
+		for (const queue of queues) {
+			await this.#promoteDue(client, queue);
+			raw = await this.#take(client, queue);
+			if (raw !== null) break;
 		}
 
 		if (!raw) return null;
@@ -339,7 +384,7 @@ export class RedisDriver implements QueueDriver {
 	 * and the job was recovered, or it was recovered and re-popped by another
 	 * worker, whose claim this one must not extend.
 	 */
-	async renew(job: Job): Promise<boolean> {
+	async renew(job: JobRecord): Promise<boolean> {
 		const client = await this.#client();
 		const key = this.#leaseKey(job.id);
 		const stored = await client.get(key);
@@ -352,13 +397,13 @@ export class RedisDriver implements QueueDriver {
 		return true;
 	}
 
-	async complete(job: Job): Promise<void> {
+	async complete(job: JobRecord): Promise<void> {
 		const client = await this.#client();
 		await this.#removeFromProcessing(job);
 		await client.del(this.#leaseKey(job.id));
 	}
 
-	async fail(job: Job, error: string): Promise<void> {
+	async fail(job: JobRecord, error: string): Promise<void> {
 		const client = await this.#client();
 		await this.#removeFromProcessing(job);
 		await client.del(this.#leaseKey(job.id));
@@ -367,12 +412,12 @@ export class RedisDriver implements QueueDriver {
 		await this.#pushFailed(client, job);
 	}
 
-	async retry(job: Job): Promise<void> {
+	async retry(job: JobRecord): Promise<void> {
 		const client = await this.#client();
 		await this.#removeFromProcessing(job);
 		await client.del(this.#leaseKey(job.id));
 		job.status = "pending";
-		await client.rpush(this.#pendingKey(), JSON.stringify(job));
+		await client.rpush(this.#pendingKey(queueOf(job)), JSON.stringify(job));
 	}
 
 	async recoverStale(): Promise<number> {
@@ -425,7 +470,12 @@ export class RedisDriver implements QueueDriver {
 
 			parsed.stalledCount = stalled;
 			parsed.status = "pending";
-			await client.rpush(this.#pendingKey(), JSON.stringify(parsed));
+			// Back to the queue it came from, not to the default one: a recovered
+			// job whose queue nobody serves would never run again.
+			await client.rpush(
+				this.#pendingKey(queueOf(parsed)),
+				JSON.stringify(parsed),
+			);
 			recovered++;
 		}
 		return recovered;
@@ -439,7 +489,7 @@ export class RedisDriver implements QueueDriver {
 	 * has capped its own at a thousand from the start; this is the same cap on
 	 * the driver where the list actually survives a restart.
 	 */
-	async #pushFailed(client: RedisClient, job: Job): Promise<void> {
+	async #pushFailed(client: RedisClient, job: JobRecord): Promise<void> {
 		await client.rpush(this.#failedKey(), JSON.stringify(job));
 		if (this.#maxFailedJobs === 0 || !client.ltrim) return;
 		await client.ltrim(this.#failedKey(), -this.#maxFailedJobs, -1);
@@ -454,7 +504,7 @@ export class RedisDriver implements QueueDriver {
 	 * the exact raw string pop() moved — and fall back to a list scan when
 	 * the lease has expired (e.g. recoverStale already handled it).
 	 */
-	async #removeFromProcessing(job: Job): Promise<void> {
+	async #removeFromProcessing(job: JobRecord): Promise<void> {
 		const client = await this.#client();
 		const stored = await client.get(this.#leaseKey(job.id));
 		if (stored !== null) {
@@ -479,7 +529,7 @@ export class RedisDriver implements QueueDriver {
 		}
 	}
 
-	async failed(): Promise<Job[]> {
+	async failed(): Promise<JobRecord[]> {
 		const client = await this.#client();
 		const raws = await client.lrange(this.#failedKey(), 0, -1);
 		return raws
@@ -491,11 +541,69 @@ export class RedisDriver implements QueueDriver {
 					return null;
 				}
 			})
-			.filter((j): j is Job => j !== null);
+			.filter((j): j is JobRecord => j !== null);
 	}
 
-	async size(): Promise<number> {
+	/**
+	 * How many jobs are waiting on `queue` — its list plus its delayed set.
+	 *
+	 * A delayed job is queued; it is simply not due. Counting only the list
+	 * reported an empty queue to anything draining one before shutdown.
+	 */
+	async size(queue: string = DEFAULT_QUEUE): Promise<number> {
 		const client = await this.#client();
-		return client.llen(this.#pendingKey());
+		const waiting = await client.llen(this.#pendingKey(queue));
+		const delayed = client.zcard
+			? await client.zcard(this.#delayedKey(queue))
+			: 0;
+		return waiting + delayed;
+	}
+
+	/**
+	 * Move `queue`'s due jobs out of the delayed set and onto its list.
+	 *
+	 * `ZREM` is the claim: two workers can read the same due entry, and only
+	 * the one whose removal returns 1 owns it. Without that the job is pushed
+	 * onto the list once per worker that saw it.
+	 */
+	async #promoteDue(client: RedisClient, queue: string): Promise<void> {
+		if (!client.zrangebyscore || !client.zrem) return;
+		const due = await client.zrangebyscore(
+			this.#delayedKey(queue),
+			0,
+			Date.now(),
+			"LIMIT",
+			"0",
+			"100",
+		);
+		for (const raw of due) {
+			const claimed = await client.zrem(this.#delayedKey(queue), raw);
+			if (claimed !== 1) continue;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(raw);
+			} catch {
+				// Already removed from the set; there is nothing runnable to push.
+				continue;
+			}
+			if (!isValidJob(parsed)) continue;
+			parsed.runAt = undefined;
+			await client.rpush(this.#pendingKey(queue), JSON.stringify(parsed));
+		}
+	}
+
+	/** Take the head of one queue, claiming it in `processing`. */
+	async #take(client: RedisClient, queue: string): Promise<string | null> {
+		if (client.lmove) {
+			return client.lmove(
+				this.#pendingKey(queue),
+				this.#processingKey(),
+				"LEFT",
+				"RIGHT",
+			);
+		}
+		const raw = await client.lpop(this.#pendingKey(queue));
+		if (raw) await client.rpush(this.#processingKey(), raw);
+		return raw;
 	}
 }

@@ -9,6 +9,7 @@
 
 interface Codemods {
 	addProvider(importPath: string): Promise<void>;
+	registerCommand(importPath: string): Promise<void>;
 	addEnvVars(vars: Record<string, string>): Promise<void>;
 	writeFile(
 		filePath: string,
@@ -26,6 +27,9 @@ export async function configure(codemods: Codemods): Promise<void> {
 	});
 
 	await codemods.addProvider("@c9up/bay/provider");
+	// `queue:work` and `make:job` are the package's, not the binary's: a
+	// project reaches them by listing the module, never by upgrading `ream`.
+	await codemods.registerCommand("@c9up/bay/commands");
 	await codemods.writeFile(
 		"config/queue.ts",
 		`import { defineConfig, drivers } from '@c9up/bay'
@@ -42,11 +46,18 @@ export default defineConfig({
   },
 
   // What the worker does between jobs: how long it waits after finding
-  // nothing, and how often it reclaims jobs a crashed worker left behind.
+  // nothing, how often it reclaims jobs a crashed worker left behind, how many
+  // it runs at once, and which named queues it serves.
   worker: {
     idleDelay: 2_000,
     stalledInterval: 30_000,
+    concurrency: 1,
+    // queues: ['critical', 'default'],
   },
+
+  // Where the job classes live. Every module under here is imported at boot,
+  // so a worker resolves a queued record by the class's own name.
+  locations: ['app/jobs'],
 })`,
 	);
 }

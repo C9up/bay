@@ -1,6 +1,12 @@
 import type { AdapterFactory } from "./adapters.js";
 import "./augmentations.js";
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
+import {
+	DEFAULT_JOBS_DIR,
+	directoryOf,
+	discoverJobs,
+	setJobsDir,
+} from "./jobs.js";
 import type { QueueDriver } from "./QueueManager.js";
 import { QueueManager, type WorkerOptions } from "./QueueManager.js";
 import { clearQueue, getQueue, setQueue } from "./services/main.js";
@@ -54,6 +60,16 @@ export interface BayProviderConfig {
 	 * by the names it gives them. An argument to `work()` still wins.
 	 */
 	worker?: WorkerOptions;
+	/**
+	 * Where the application's job classes live. Default `['app/jobs']`.
+	 *
+	 * Every module under them is imported at boot and a default export that is
+	 * a job class is registered under its own name — which is what lets a
+	 * worker process resolve a record queued by an HTTP one. Without it the
+	 * registration list is a directory kept in step by hand, and the job
+	 * nobody added to it fails as "no handler registered".
+	 */
+	locations?: readonly string[];
 }
 
 /**
@@ -153,6 +169,15 @@ export default class BayProvider {
 		// `import queue from '@c9up/bay/services/main'` from anywhere.
 		this.#queue = await this.app.container.resolve<QueueManager>(QueueManager);
 		setQueue(this.#queue);
+
+		const config = this.app.config.get<BayProviderConfig>("queue");
+		const locations = config?.locations ?? [DEFAULT_JOBS_DIR];
+		// `make:job` writes where discovery reads, so the two cannot drift.
+		const first = locations[0];
+		if (first !== undefined) setJobsDir(directoryOf(first));
+		for (const job of await discoverJobs(locations)) {
+			this.#queue.registerJob(job);
+		}
 	}
 
 	/**

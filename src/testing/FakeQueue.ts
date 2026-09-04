@@ -9,7 +9,7 @@
  * the fake into a runtime build.
  */
 
-import type { Job, QueueDriver } from "../QueueManager.js";
+import type { JobRecord, QueueDriver } from "../QueueManager.js";
 
 export interface FakeQueuePredicate {
 	/** Custom payload predicate — receives the job's `payload` and
@@ -23,12 +23,12 @@ export interface FakeQueuePredicate {
 
 export type FakeQueuePredicateArg =
 	| FakeQueuePredicate
-	| ((job: Job) => boolean);
+	| ((job: JobRecord) => boolean);
 
 export class FakeQueue implements QueueDriver {
-	#pushed: Job[] = [];
+	#pushed: JobRecord[] = [];
 
-	async push(job: Job): Promise<void> {
+	async push(job: JobRecord): Promise<void> {
 		// Reject duplicate ids to surface the most common test-fixture
 		// mistake — two `makeJob({ id: 'x' })` reused across pushes
 		// silently corrupts later `fail`/`complete`/`retry` lookups.
@@ -43,23 +43,29 @@ export class FakeQueue implements QueueDriver {
 	/** Always returns `null` — fake queues never auto-dispatch.
 	 *  Tests that need handler execution should use the memory
 	 *  driver directly. */
-	async pop(): Promise<Job | null> {
+	/**
+	 * Always empty: this fake captures what was dispatched, it does not run it.
+	 *
+	 * The parameter is declared so the queue names a caller asks for are part of
+	 * the signature a test reads, even though nothing here serves them.
+	 */
+	async pop(_queues?: readonly string[]): Promise<JobRecord | null> {
 		return null;
 	}
 
-	async fail(job: Job, error: string): Promise<void> {
+	async fail(job: JobRecord, error: string): Promise<void> {
 		const found = this.#requireJob(job, "fail");
 		found.status = "failed";
 		found.error = error;
 	}
 
-	async complete(job: Job): Promise<void> {
+	async complete(job: JobRecord): Promise<void> {
 		const found = this.#requireJob(job, "complete");
 		found.status = "completed";
 		found.processedAt = Date.now();
 	}
 
-	async retry(job: Job): Promise<void> {
+	async retry(job: JobRecord): Promise<void> {
 		const found = this.#requireJob(job, "retry");
 		// `attempts` is the WORKER's counter, not the driver's: `processOne`
 		// increments it before it calls this, and neither real driver touches it
@@ -77,9 +83,9 @@ export class FakeQueue implements QueueDriver {
 
 	/** Look up the captured copy of a job by id. Throws when the id
 	 *  isn't present — silent no-op on a missing job is the most
-	 *  insidious test bug (caller's local Job ref shows the new
+	 *  insidious test bug (caller's local job ref shows the new
 	 *  status while the FakeQueue's internal capture is unchanged). */
-	#requireJob(job: Job, verb: string): Job {
+	#requireJob(job: JobRecord, verb: string): JobRecord {
 		const found = this.#pushed.find((j) => j.id === job.id);
 		if (!found) {
 			throw new Error(
@@ -89,7 +95,7 @@ export class FakeQueue implements QueueDriver {
 		return found;
 	}
 
-	async failed(): Promise<Job[]> {
+	async failed(): Promise<JobRecord[]> {
 		return this.#pushed
 			.filter((j) => j.status === "failed")
 			.map((j) => ({ ...j }));
@@ -104,7 +110,7 @@ export class FakeQueue implements QueueDriver {
 	 * shallow clone so test-side mutations can't bleed back into the
 	 * internal capture store — avoids cross-test contamination.
 	 */
-	getPushed(): Job[] {
+	getPushed(): JobRecord[] {
 		return this.#pushed.map((j) => ({ ...j }));
 	}
 
@@ -133,7 +139,7 @@ export class FakeQueue implements QueueDriver {
 function makeMatcher(
 	name: string,
 	predicate: FakeQueuePredicateArg | undefined,
-): (j: Job) => boolean {
+): (j: JobRecord) => boolean {
 	// Function-form predicate — caller does ALL the matching, the
 	// `name` arg is still a hard prerequisite.
 	if (typeof predicate === "function") {
@@ -166,7 +172,7 @@ function describePredicate(
 	return `, ${JSON.stringify(predicate)}`;
 }
 
-function describeCaptured(captured: Job[]): string {
+function describeCaptured(captured: JobRecord[]): string {
 	if (captured.length === 0) return "Captured: (none)";
 	const lines = captured.map(
 		(j, i) =>

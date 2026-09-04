@@ -3,7 +3,7 @@ import {
 	type RedisClient,
 	RedisDriver,
 } from "../../src/drivers/RedisDriver.js";
-import type { Job } from "../../src/QueueManager.js";
+import type { JobRecord } from "../../src/QueueManager.js";
 
 /** Narrow away null/undefined without a `!` non-null assertion (which lies to the compiler). */
 function defined<T>(value: T | null | undefined): T {
@@ -81,7 +81,7 @@ function createFakeRedis(opts?: { withLmove?: boolean }): {
 	return { client, lists, keys };
 }
 
-function makeJob(over: Partial<Job> = {}): Job {
+function makeJob(over: Partial<JobRecord> = {}): JobRecord {
 	return {
 		id: "job_x",
 		name: "send-email",
@@ -168,7 +168,7 @@ describe("bay > RedisDriver > push/pop", () => {
 		expect(await driver.pop()).toBeNull();
 	});
 
-	it("pop returns null when the popped value is JSON but not a Job shape", async () => {
+	it("pop returns null when the popped value is JSON but not a JobRecord shape", async () => {
 		const fake = createFakeRedis();
 		const driver = new RedisDriver(fake.client);
 		await fake.client.rpush("queue:pending", JSON.stringify({ foo: "bar" }));
@@ -258,7 +258,7 @@ describe("bay > RedisDriver > recoverStale", () => {
 		expect(await driver.recoverStale()).toBe(0);
 	});
 
-	it("skips processing entries that aren't valid Job shapes", async () => {
+	it("skips processing entries that aren't valid JobRecord shapes", async () => {
 		const fake = createFakeRedis();
 		const driver = new RedisDriver(fake.client);
 		await fake.client.rpush(
@@ -270,7 +270,7 @@ describe("bay > RedisDriver > recoverStale", () => {
 });
 
 describe("bay > RedisDriver > failed() / size()", () => {
-	it("failed() returns parsed Job objects, filtering out malformed entries", async () => {
+	it("failed() returns parsed JobRecord objects, filtering out malformed entries", async () => {
 		const fake = createFakeRedis();
 		const driver = new RedisDriver(fake.client);
 		const j = makeJob({ id: "ok", error: "boom" });

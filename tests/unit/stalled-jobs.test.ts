@@ -3,7 +3,7 @@ import {
 	type RedisClient,
 	RedisDriver,
 } from "../../src/drivers/RedisDriver.js";
-import { type Job, QueueManager } from "../../src/QueueManager.js";
+import { type JobRecord, QueueManager } from "../../src/QueueManager.js";
 
 /**
  * A Redis that honours `PX`, which the other fakes in this suite do not need
@@ -91,7 +91,7 @@ function fakeRedis(): {
 	return { client, lists, keys };
 }
 
-function makeJob(id: string): Job {
+function makeJob(id: string): JobRecord {
 	return {
 		id,
 		name: "work",

@@ -9,15 +9,20 @@ import { configure } from "../../src/configure.js";
 
 function fakeCodemods() {
 	const providers: string[] = [];
+	const commands: string[] = [];
 	const files: Array<{ path: string; content: string }> = [];
 	const env: Record<string, string> = {};
 	return {
 		providers,
+		commands,
 		files,
 		env,
 		codemods: {
 			async addProvider(importPath: string) {
 				providers.push(importPath);
+			},
+			async registerCommand(importPath: string) {
+				commands.push(importPath);
 			},
 			async addEnvVars(vars: Record<string, string>) {
 				Object.assign(env, vars);
@@ -31,12 +36,15 @@ function fakeCodemods() {
 
 describe("bay > configure", () => {
 	it("registers the provider and writes the config it reads", async () => {
-		const { providers, files, codemods } = fakeCodemods();
+		const { providers, commands, files, codemods } = fakeCodemods();
 
 		await configure(codemods);
 
 		expect(providers).toEqual(["@c9up/bay/provider"]);
 		expect(files.map((f) => f.path)).toEqual(["config/queue.ts"]);
+		// `queue:work` and `make:job` come from the package, never from the
+		// binary: without this line a project has the provider and no commands.
+		expect(commands).toEqual(["@c9up/bay/commands"]);
 	});
 
 	it("declares the environment variables the config reads", async () => {
