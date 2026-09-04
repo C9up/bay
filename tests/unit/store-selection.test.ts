@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { drivers, stores } from "../../src/adapters.js";
-import BayProvider, { type BayProviderConfig } from "../../src/BayProvider.js";
+import BayProvider, {
+	type BayAppContext,
+	type BayProviderConfig,
+} from "../../src/BayProvider.js";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { QueueManager } from "../../src/QueueManager.js";
+import { defined } from "../__helpers__/defined.js";
 
 /**
  * `{ default, adapters }` — the shape a package takes when several backends are
@@ -14,18 +18,18 @@ import { QueueManager } from "../../src/QueueManager.js";
  */
 function managerFrom(config: BayProviderConfig | undefined): QueueManager {
 	const bindings = new Map<unknown, () => unknown>();
-	const app = {
+	const app: BayAppContext = {
 		container: {
 			singleton(token: unknown, factory: () => unknown) {
 				bindings.set(token, factory);
 			},
-			resolve: <T>(token: unknown): T => bindings.get(token)?.() as T,
+			async resolve<T>(token: unknown): Promise<T> {
+				return defined(bindings.get(token))() as T;
+			},
 		},
 		config: { get: <T>() => config as T },
 	};
-	// biome-ignore lint/suspicious/noExplicitAny: the provider's app context is
-	// structural; the stub above is the slice register() touches.
-	new BayProvider(app as any).register();
+	new BayProvider(app).register();
 	return bindings.get(QueueManager)?.() as QueueManager;
 }
 
@@ -195,7 +199,7 @@ describe("bay > the token the framework namespaces", () => {
 		// their own manager here for a reason the provider is not responsible
 		// for.
 		const built = new Map<unknown, unknown>();
-		const app = {
+		const app: BayAppContext = {
 			container: {
 				singleton(token: unknown, factory: () => unknown) {
 					bindings.set(token, () => {
@@ -203,13 +207,13 @@ describe("bay > the token the framework namespaces", () => {
 						return built.get(token);
 					});
 				},
-				resolve: <T>(token: unknown): T => bindings.get(token)?.() as T,
+				async resolve<T>(token: unknown): Promise<T> {
+					return defined(bindings.get(token))() as T;
+				},
 			},
 			config: { get: <T>() => config as T },
 		};
-		// biome-ignore lint/suspicious/noExplicitAny: the provider's app context is
-		// structural; the stub above is the slice register() touches.
-		new BayProvider(app as any).register();
+		new BayProvider(app).register();
 		return bindings;
 	}
 

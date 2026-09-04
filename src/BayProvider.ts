@@ -17,11 +17,16 @@ import { clearQueue, getQueue, setQueue } from "./services/main.js";
  * `singleton(token, factory)` + `resolve(token)` and a config store
  * with `get(key)` satisfies the contract.
  */
-interface BayContainer {
+/**
+ * The slice of a host container bay uses. Exported because `BayAppContext` is:
+ * a host — or a test — cannot describe one without being able to name its
+ * members, and the two that could not were reached for with `as any` instead.
+ */
+export interface BayContainer {
 	singleton(token: unknown, factory: () => unknown): void;
 	resolve<T = unknown>(token: unknown): Promise<T>;
 }
-interface BayConfigStore {
+export interface BayConfigStore {
 	get<T = unknown>(key: string): T | undefined;
 }
 export interface BayAppContext {

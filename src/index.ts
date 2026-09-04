@@ -17,7 +17,12 @@ export {
 
 import "./augmentations.js";
 
-export type { BayProviderConfig } from "./BayProvider.js";
+export type {
+	BayAppContext,
+	BayConfigStore,
+	BayContainer,
+	BayProviderConfig,
+} from "./BayProvider.js";
 export { MemoryDriver } from "./drivers/MemoryDriver.js";
 export type { RedisClient } from "./drivers/RedisDriver.js";
 export { RedisDriver } from "./drivers/RedisDriver.js";
