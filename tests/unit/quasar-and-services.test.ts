@@ -52,6 +52,23 @@ afterEach(() => {
 });
 
 describe("bay > the quasar bridge", () => {
+	it("accepts a manager that answers only through a get trap", async () => {
+		// Quasar's accessor is a Proxy over an empty null-prototype object with
+		// only a `get` trap, so `"connection" in manager` is FALSE while reading
+		// it returns the function. Probing with `in` rejected the real manager —
+		// and every unit test here used a plain object, so only the live-Redis
+		// suite noticed.
+		const connection = client();
+		mockQuasar({
+			default: new Proxy(Object.create(null), {
+				get: (_target, property) =>
+					property === "connection" ? () => connection : undefined,
+			}),
+		});
+
+		expect(await (await load())("jobs")()).toBe(connection);
+	});
+
 	it("hands back the named connection", async () => {
 		const connection = client();
 		const manager = { connection: vi.fn(() => connection) };
