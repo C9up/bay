@@ -1,84 +1,40 @@
 /**
  * Resolving a Redis connection by name, from `@c9up/quasar`.
  *
- * Bay does not depend on quasar: it is an optional peer, and this module
- * never imports it statically. The specifier is built at runtime so the
- * TypeScript build stays free of it too — a hard type import would make bay
- * unbuildable for anyone who queues in memory.
- *
- * The shape is checked before use rather than asserted, the same way bay
- * duck-types its host framework.
+ * The loading, the shape check and the messages are the same in every package
+ * that offers a Redis-backed option, so they are vendored rather than written
+ * again: `src/vendor/quasarConnection.ts`, generated from one source. What is
+ * specific to this package — the commands it issues, and what it does with
+ * them — stays here, because that is the part a reader needs.
  */
 
 import type { RedisClient } from "./drivers/RedisDriver.js";
+import { quasarConnection as loadQuasarConnection } from "./vendor/quasarConnection.js";
 
-/** The slice of quasar's manager this needs: a connection, by name. */
-interface ConnectionSource {
-	connection(name?: string): unknown;
-}
-
-function isConnectionSource(value: unknown): value is ConnectionSource {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		typeof Reflect.get(value, "connection") === "function"
-	);
-}
-
-function isRedisClient(value: unknown): value is RedisClient {
-	if (typeof value !== "object" || value === null) return false;
-	// The commands this driver actually issues — every non-optional member of
-	// `RedisClient`. A connection missing one would fail on the first job push,
-	// far from the cause. `lmove` is deliberately absent: the driver declares it
-	// optional and falls back when it is not there.
-	const required = [
-		"rpush",
-		"lpop",
-		"lrem",
-		"llen",
-		"lrange",
-		"del",
-		"set",
-		"get",
-	];
-	return required.every(
-		(name) => typeof Reflect.get(value, name) === "function",
-	);
-}
+// The commands this driver actually issues — every non-optional member of
+// `RedisClient`. `lmove` is deliberately absent: the driver declares it
+// optional and falls back when it is not there.
+const REQUIRED = [
+	"rpush",
+	"lpop",
+	"lrem",
+	"llen",
+	"lrange",
+	"del",
+	"set",
+	"get",
+] as const;
 
 /**
- * A resolver for `new RedisDriver(quasarConnection("jobs"))` — quasar is
- * loaded on the first queue command, not at config time.
+ * A resolver — quasar is loaded on first use, not at config time.
  */
 export function quasarConnection(name?: string): () => Promise<RedisClient> {
-	return async () => {
-		const specifier = "@c9up/quasar/services/main";
-		let loaded: unknown;
-		try {
-			loaded = await import(/* @vite-ignore */ specifier);
-		} catch (cause) {
-			throw new Error(
-				`Bay: the "${name ?? "default"}" queue asks for a quasar connection, but @c9up/quasar is not installed.\n` +
-					"  pnpm add @c9up/quasar",
-				{ cause },
-			);
-		}
-
-		const manager = isConnectionSource(loaded)
-			? loaded
-			: Reflect.get(Object(loaded), "default");
-		if (!isConnectionSource(manager)) {
-			throw new Error(
-				"Bay: @c9up/quasar/services/main did not expose a connection() manager",
-			);
-		}
-
-		const connection = manager.connection(name);
-		if (!isRedisClient(connection)) {
-			throw new Error(
-				`Bay: quasar connection "${name ?? "default"}" does not carry the commands this queue needs`,
-			);
-		}
-		return connection;
-	};
+	return async () =>
+		loadQuasarConnection<RedisClient>({
+			pkg: "bay",
+			name,
+			required: REQUIRED,
+			what: "the queue driver",
+			raise: (_reason, message, cause) => new Error(message, { cause }),
+		});
 }

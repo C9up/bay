@@ -84,8 +84,8 @@ describe("bay > the quasar bridge", () => {
 		});
 		const resolve = await load();
 
-		await expect(resolve("jobs")()).rejects.toThrow(/"jobs" queue/);
-		await expect(resolve()()).rejects.toThrow(/"default" queue/);
+		await expect(resolve("jobs")()).rejects.toThrow(/quasar connection "jobs"/);
+		await expect(resolve()()).rejects.toThrow(/quasar connection "default"/);
 	});
 
 	it("refuses a module that is not a connection manager", async () => {
@@ -103,8 +103,10 @@ describe("bay > the quasar bridge", () => {
 			vi.resetModules();
 			mockQuasar({ default: { connection: () => client(missing) } });
 
+			// The message names the connection AND the missing command — the
+			// point of checking before handing it over.
 			await expect((await load())("jobs")(), missing).rejects.toThrow(
-				/does not carry the commands this queue needs/,
+				new RegExp(`connection 'jobs' is missing ${missing}`),
 			);
 		}
 	});
