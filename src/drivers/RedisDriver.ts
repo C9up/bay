@@ -19,8 +19,8 @@
  */
 
 import { DEFAULT_QUEUE } from "../Job.js";
-import { inProduction } from "../nodeEnv.js";
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
+import { inProduction } from "../vendor/nodeEnv.js";
 
 export interface RedisClient {
 	rpush(key: string, ...values: string[]): Promise<number>;
@@ -130,6 +130,10 @@ function checkLmove(client: RedisClient, allowNonAtomicPop: boolean): void {
 	// job from pending before it reaches processing: nothing recovers it,
 	// because nothing knows it existed. That is a different product, and in
 	// production it must be asked for rather than fallen into.
+	// Read through `inProduction()` rather than `NODE_ENV === "production"`:
+	// `NODE_ENV=prod` is ordinary in a Dockerfile, and taken verbatim it answers
+	// "not production" — so this queue would silently accept a delivery
+	// guarantee weaker than the one it advertises.
 	if (inProduction() && !allowNonAtomicPop) {
 		throw new Error(
 			"[bay] this Redis client has no LMOVE (Redis < 6.2), so pop() would be a non-atomic lpop+rpush — " +
