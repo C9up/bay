@@ -59,10 +59,21 @@ async function walk(dir: string, depth = 0): Promise<string[]> {
 	let entries: import("node:fs").Dirent[];
 	try {
 		entries = await fsp.readdir(dir, { withFileTypes: true });
-	} catch {
-		// A declared directory that does not exist yet is not an error: a project
+	} catch (err) {
+		// A declared directory that does not exist YET is not an error: a project
 		// can name where its jobs will go before writing the first one.
-		return [];
+		//
+		// Anything else is. Reading every failure as "empty" meant a permission
+		// denial, a broken mount or a path pointing at a file produced a worker
+		// with no handlers and nothing said — the queue accepted jobs and
+		// processed none of them.
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw new Error(
+			`[bay] cannot read the jobs directory '${dir}': ${
+				err instanceof Error ? err.message : String(err)
+			}`,
+			{ cause: err },
+		);
 	}
 	const found: string[] = [];
 	for (const entry of entries) {
@@ -87,25 +98,47 @@ async function walk(dir: string, depth = 0): Promise<string[]> {
  */
 export async function discoverJobs(
 	locations: readonly string[],
+	/**
+	 * Turn a configured location into an absolute path.
+	 *
+	 * The host supplies it — `app.makePath` on ream — because `app/jobs` means
+	 * "under the application root", not "under whatever directory the process
+	 * happens to have started in". Resolving against `process.cwd()` gave a
+	 * worker launched from anywhere else a silent empty discovery.
+	 *
+	 * Absent, the old cwd-relative behaviour stands: bay is agnostic, and a host
+	 * with no notion of an application root has nothing better to offer.
+	 */
+	resolveLocation: (location: string) => string = (location) =>
+		path.resolve(location),
 ): Promise<JobClass[]> {
 	const found: JobClass[] = [];
+	let scanned = 0;
+	const failures: string[] = [];
 	for (const location of locations) {
-		for (const file of await walk(directoryOf(location))) {
+		for (const file of await walk(resolveLocation(directoryOf(location)))) {
+			scanned += 1;
 			let module: unknown;
 			try {
 				module = await import(pathToFileURL(path.resolve(file)).href);
 			} catch (err) {
-				process.stderr.write(
-					`[bay] could not load '${file}': ${
-						err instanceof Error ? err.message : String(err)
-					}\n`,
-				);
+				const message = err instanceof Error ? err.message : String(err);
+				failures.push(`${file}: ${message}`);
+				process.stderr.write(`[bay] could not load '${file}': ${message}\n`);
 				continue;
 			}
 			if (typeof module !== "object" || module === null) continue;
 			const exported = Reflect.get(module, "default");
 			if (isJobClass(exported)) found.push(exported);
 		}
+	}
+	// Skipping ONE broken file so the others still run is the point of the catch
+	// above. Ending with nothing at all because every file was broken is a
+	// different thing: the worker would come up, accept jobs and process none.
+	if (found.length === 0 && scanned > 0 && failures.length === scanned) {
+		throw new Error(
+			`[bay] every job file failed to load, so the worker has no handlers:\n  ${failures.join("\n  ")}`,
+		);
 	}
 	return found;
 }

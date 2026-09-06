@@ -255,6 +255,64 @@ export default class SendEmail extends Job { async execute() {} }
 		expect(found.map((job) => job.name)).toEqual(["SendEmail"]);
 	});
 
+	it("resolves a location through the host, not the process's directory", async () => {
+		// `app/jobs` means "under the application root". Resolving against
+		// `process.cwd()` gave a worker launched from anywhere else an empty
+		// discovery, and gave it silently.
+		await fsp.writeFile(
+			path.join(dir, "send_email.mjs"),
+			`import { Job } from "${new URL("../../src/Job.ts", import.meta.url).href}";
+export default class SendEmail extends Job { async execute() {} }
+`,
+		);
+		const seen: string[] = [];
+		const found = await discoverJobs(["app/jobs"], (location) => {
+			seen.push(location);
+			return dir;
+		});
+
+		expect(seen).toEqual(["app/jobs"]);
+		expect(found.map((job) => job.name)).toEqual(["SendEmail"]);
+	});
+
+	it("refuses a jobs directory it cannot read, instead of reading it as empty", async () => {
+		// A permission denial, a broken mount, a path that names a file: every
+		// one of them used to produce a worker with no handlers and no message.
+		// It accepted jobs and processed none of them.
+		const notADirectory = path.join(dir, "jobs.txt");
+		await fsp.writeFile(notADirectory, "not a directory\n");
+
+		await expect(discoverJobs([notADirectory])).rejects.toThrow(
+			/cannot read the jobs directory/,
+		);
+	});
+
+	it("still treats a directory that does not exist yet as empty", async () => {
+		// Naming where the jobs will go before writing the first one is normal.
+		await expect(
+			discoverJobs([path.join(dir, "not-created-yet")]),
+		).resolves.toEqual([]);
+	});
+
+	it("refuses to come up with no handlers when EVERY job file failed", async () => {
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		try {
+			await fsp.writeFile(path.join(dir, "a.mjs"), "%%% not js\n");
+			await fsp.writeFile(path.join(dir, "b.mjs"), "%%% not js either\n");
+
+			// Skipping ONE broken file so the rest still run is deliberate.
+			// Skipping all of them leaves a worker that accepts jobs and runs
+			// nothing, which is a broken deploy rather than a warning.
+			await expect(discoverJobs([dir])).rejects.toThrow(
+				/every job file failed to load/,
+			);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
 	it("reports a module it cannot load and keeps going", async () => {
 		const stderr = vi
 			.spyOn(process.stderr, "write")

@@ -32,6 +32,18 @@ export interface BayConfigStore {
 export interface BayAppContext {
 	container: BayContainer;
 	config: BayConfigStore;
+	/**
+	 * Resolve a path against the application root (AdonisJS `app.makePath`).
+	 *
+	 * `app/jobs` means "under the application root", not "under whatever
+	 * directory the process started in". Without this, discovery resolved
+	 * against `process.cwd()`, so a worker launched from anywhere else found
+	 * nothing — and found it silently.
+	 *
+	 * Optional, because bay is agnostic: a host with no notion of an
+	 * application root leaves discovery cwd-relative, as before.
+	 */
+	makePath?(...segments: string[]): string;
 }
 
 export interface BayProviderConfig {
@@ -180,7 +192,8 @@ export default class BayProvider {
 		// `make:job` writes where discovery reads, so the two cannot drift.
 		const first = locations[0];
 		if (first !== undefined) setJobsDir(directoryOf(first));
-		for (const job of await discoverJobs(locations)) {
+		const resolveLocation = this.app.makePath?.bind(this.app);
+		for (const job of await discoverJobs(locations, resolveLocation)) {
 			this.#queue.registerJob(job);
 		}
 	}
