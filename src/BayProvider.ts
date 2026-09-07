@@ -187,14 +187,34 @@ export default class BayProvider {
 		this.#queue = await this.app.container.resolve<QueueManager>(QueueManager);
 		setQueue(this.#queue);
 
+		// `make:job` writes where discovery reads, so the two cannot drift. This
+		// half is pure bookkeeping and belongs with the rest of boot.
+		const config = this.app.config.get<BayProviderConfig>("queue");
+		const first = (config?.locations ?? [DEFAULT_JOBS_DIR])[0];
+		if (first !== undefined) setJobsDir(directoryOf(first));
+	}
+
+	/**
+	 * Discover the application's jobs.
+	 *
+	 * In `start()`, not `boot()`. Discovery IMPORTS application modules, and a
+	 * job that reaches for a container service — the ordinary way to write one —
+	 * was then waiting on a boot that was waiting on its import. Upstream runs
+	 * preloads between the two phases for this reason: by `start()` the
+	 * application is assembled and a job may depend on it.
+	 */
+	async start(): Promise<void> {
+		const queue = this.#queue;
+		if (queue === undefined) {
+			throw new Error(
+				"BayProvider.start() ran before boot() — providers boot before they start.",
+			);
+		}
 		const config = this.app.config.get<BayProviderConfig>("queue");
 		const locations = config?.locations ?? [DEFAULT_JOBS_DIR];
-		// `make:job` writes where discovery reads, so the two cannot drift.
-		const first = locations[0];
-		if (first !== undefined) setJobsDir(directoryOf(first));
 		const resolveLocation = this.app.makePath?.bind(this.app);
 		for (const job of await discoverJobs(locations, resolveLocation)) {
-			this.#queue.registerJob(job);
+			queue.registerJob(job);
 		}
 	}
 

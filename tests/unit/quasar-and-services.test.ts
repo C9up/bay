@@ -296,3 +296,50 @@ describe("bay > defineConfig", () => {
 		expect(defineConfig(config)).toBe(config);
 	});
 });
+
+/**
+ * Discovery imports application modules, so it belongs in `start()`.
+ *
+ * In `boot()` it ran before preloads: a job reaching for a container service —
+ * the ordinary way to write one — waited on a boot that was waiting on its own
+ * import. Upstream runs preloads between the two phases for exactly this.
+ */
+describe("bay > when jobs are discovered", () => {
+	const app = (locations: string[]) => {
+		const bindings = new Map<unknown, () => unknown>();
+		const built = new Map<unknown, unknown>();
+		return {
+			config: { get: <T>(): T | undefined => ({ locations }) as T },
+			container: {
+				singleton(token: unknown, factory: () => unknown) {
+					bindings.set(token, factory);
+				},
+				async resolve<T>(token: unknown): Promise<T> {
+					if (!built.has(token)) {
+						const factory = bindings.get(token);
+						if (!factory) throw new Error(`unbound: ${String(token)}`);
+						built.set(token, await factory());
+					}
+					return built.get(token) as T;
+				},
+			},
+		};
+	};
+
+	it("does not import anything during boot", async () => {
+		// A directory of unloadable files: discovery would throw. Reaching boot
+		// without a throw is the proof that it did not scan.
+		const provider = new BayProvider(app(["./does-not-exist-either"]) as never);
+		provider.register();
+
+		await expect(provider.boot()).resolves.toBeUndefined();
+		await provider.shutdown();
+	});
+
+	it("refuses to start before it has booted", async () => {
+		const provider = new BayProvider(app(["./nowhere"]) as never);
+		provider.register();
+
+		await expect(provider.start()).rejects.toThrow(/before boot\(\)/);
+	});
+});

@@ -96,6 +96,14 @@ async function walk(dir: string, depth = 0): Promise<string[]> {
  * A module that throws on import is reported and skipped: one unfinished job
  * file must not stop the worker from running every other job.
  */
+/** Name what was exported, so the message points at the actual mistake. */
+function describe(value: unknown): string {
+	if (typeof value === "function")
+		return `a function named '${value.name || "(anonymous)"}'`;
+	if (value === null) return "null";
+	return typeof value;
+}
+
 export async function discoverJobs(
 	locations: readonly string[],
 	/**
@@ -114,7 +122,10 @@ export async function discoverJobs(
 ): Promise<JobClass[]> {
 	const found: JobClass[] = [];
 	let scanned = 0;
+	/** Files that could not be imported at all. */
 	const failures: string[] = [];
+	/** Files that imported cleanly but held no Job. */
+	const rejected: string[] = [];
 	for (const location of locations) {
 		for (const file of await walk(resolveLocation(directoryOf(location)))) {
 			scanned += 1;
@@ -127,17 +138,37 @@ export async function discoverJobs(
 				process.stderr.write(`[bay] could not load '${file}': ${message}\n`);
 				continue;
 			}
-			if (typeof module !== "object" || module === null) continue;
+			if (typeof module !== "object" || module === null) {
+				rejected.push(`${file}: the module is not an object`);
+				continue;
+			}
 			const exported = Reflect.get(module, "default");
-			if (isJobClass(exported)) found.push(exported);
+			if (isJobClass(exported)) {
+				found.push(exported);
+				continue;
+			}
+			// Loaded fine, exported the wrong thing. Skipped in silence before,
+			// which is the shape a rename or a forgotten `export default` takes:
+			// the file is there, it compiles, and the job never runs.
+			const what =
+				exported === undefined
+					? "no default export"
+					: `a default export that is not a Job subclass (${describe(exported)})`;
+			rejected.push(`${file}: ${what}`);
+			process.stderr.write(`[bay] ignoring '${file}' — ${what}\n`);
 		}
 	}
-	// Skipping ONE broken file so the others still run is the point of the catch
-	// above. Ending with nothing at all because every file was broken is a
-	// different thing: the worker would come up, accept jobs and process none.
-	if (found.length === 0 && scanned > 0 && failures.length === scanned) {
+	// Skipping ONE unusable file so the others still run is the point of the
+	// catch above. Ending with nothing at all is a different thing: the worker
+	// comes up, accepts jobs and processes none.
+	//
+	// The reason no longer matters. This used to fire only when every file
+	// failed to LOAD, so a directory of files that all compiled and all exported
+	// the wrong thing — a rename, a forgotten `export default` — produced an
+	// empty discovery and a silent worker.
+	if (found.length === 0 && scanned > 0) {
 		throw new Error(
-			`[bay] every job file failed to load, so the worker has no handlers:\n  ${failures.join("\n  ")}`,
+			`[bay] ${scanned} job file(s) were scanned and none yielded a Job, so the worker has no handlers:\n  ${[...failures, ...rejected].join("\n  ")}`,
 		);
 	}
 	return found;

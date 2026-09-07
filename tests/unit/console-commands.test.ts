@@ -294,6 +294,31 @@ export default class SendEmail extends Job { async execute() {} }
 		).resolves.toEqual([]);
 	});
 
+	it("refuses to come up when every file loads but none holds a Job", async () => {
+		// The shape a rename or a forgotten `export default` takes: the files
+		// are there, they compile, and the worker comes up with no handlers.
+		// The old guard only fired when every file failed to LOAD, so this
+		// passed through in silence.
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		try {
+			await fsp.writeFile(
+				path.join(dir, "a.mjs"),
+				"export const NotDefault = class {}\n",
+			);
+			await fsp.writeFile(path.join(dir, "b.mjs"), "export default 42\n");
+
+			await expect(discoverJobs([dir])).rejects.toThrow(/none yielded a Job/);
+			// And it names what it found instead, so the fix is obvious.
+			const said = stderr.mock.calls.map((c) => String(c[0])).join("");
+			expect(said).toContain("no default export");
+			expect(said).toContain("not a Job subclass");
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
 	it("refuses to come up with no handlers when EVERY job file failed", async () => {
 		const stderr = vi
 			.spyOn(process.stderr, "write")
@@ -305,9 +330,7 @@ export default class SendEmail extends Job { async execute() {} }
 			// Skipping ONE broken file so the rest still run is deliberate.
 			// Skipping all of them leaves a worker that accepts jobs and runs
 			// nothing, which is a broken deploy rather than a warning.
-			await expect(discoverJobs([dir])).rejects.toThrow(
-				/every job file failed to load/,
-			);
+			await expect(discoverJobs([dir])).rejects.toThrow(/none yielded a Job/);
 		} finally {
 			stderr.mockRestore();
 		}
