@@ -223,6 +223,51 @@ describe("bay > finding the job classes", () => {
 		dir = await fixture("discover");
 	});
 
+	it("descends into subdirectories", async () => {
+		// `make:job emails/SendInvoice` writes a nested file, so a discovery that
+		// only read the top level would miss exactly what the generator makes.
+		await fsp.mkdir(path.join(dir, "emails"), { recursive: true });
+		await fsp.writeFile(
+			path.join(dir, "emails", "nested.mjs"),
+			`import { Job } from "${new URL("../../src/Job.ts", import.meta.url).href}";\nexport default class NestedJob extends Job { async execute() {} }\n`,
+		);
+		await fsp.writeFile(
+			path.join(dir, "top.mjs"),
+			`import { Job } from "${new URL("../../src/Job.ts", import.meta.url).href}";\nexport default class TopJob extends Job { async execute() {} }\n`,
+		);
+
+		const found = await discoverJobs([dir]);
+
+		expect(found.map((j) => j.name).sort()).toEqual(["NestedJob", "TopJob"]);
+	});
+
+	it("ignores a declaration file", async () => {
+		// A `.d.ts` beside a job is a declaration, not a module with a job in it,
+		// and importing one is an error rather than an empty result.
+		await fsp.writeFile(path.join(dir, "types.d.ts"), "export {}\n");
+		await fsp.writeFile(
+			path.join(dir, "real.mjs"),
+			`import { Job } from "${new URL("../../src/Job.ts", import.meta.url).href}";\nexport default class RealJob extends Job { async execute() {} }\n`,
+		);
+
+		const found = await discoverJobs([dir]);
+
+		expect(found.map((j) => j.name)).toEqual(["RealJob"]);
+	});
+
+	it("reports a module that is not an object at all", async () => {
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		try {
+			await fsp.writeFile(path.join(dir, "a.mjs"), "export default null\n");
+
+			await expect(discoverJobs([dir])).rejects.toThrow(/none yielded a Job/);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
 	afterEach(async () => {
 		await fsp.rm(dir, { recursive: true, force: true });
 		setJobsDir("app/jobs");

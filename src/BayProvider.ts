@@ -197,17 +197,23 @@ export default class BayProvider {
 	/**
 	 * Discover the application's jobs.
 	 *
-	 * In `start()`, not `boot()`. Discovery IMPORTS application modules, and a
-	 * job that reaches for a container service — the ordinary way to write one —
-	 * was then waiting on a boot that was waiting on its import. Upstream runs
-	 * preloads between the two phases for this reason: by `start()` the
-	 * application is assembled and a job may depend on it.
+	 * In `ready()`, and the phase matters. Discovery IMPORTS application
+	 * modules, and a job that reaches for a container service — the ordinary way
+	 * to write one — needs whatever the preloads registered to exist already.
+	 *
+	 * Upstream's warm-up is `providers.start()` → the `starting` hooks → the
+	 * preloads, and `ready()` runs after all of it. `start()` is therefore NOT
+	 * after the preloads, which an earlier version of this comment claimed and
+	 * the code was placed on; `ready()` is.
+	 *
+	 * It is also the phase an inspection does not run, so `ream inspect` or a
+	 * codegen pass no longer imports every job in the application.
 	 */
-	async start(): Promise<void> {
+	async ready(): Promise<void> {
 		const queue = this.#queue;
 		if (queue === undefined) {
 			throw new Error(
-				"BayProvider.start() ran before boot() — providers boot before they start.",
+				"BayProvider.ready() ran before boot() — providers boot before they are ready.",
 			);
 		}
 		const config = this.app.config.get<BayProviderConfig>("queue");

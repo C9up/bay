@@ -336,10 +336,10 @@ describe("bay > when jobs are discovered", () => {
 		await provider.shutdown();
 	});
 
-	it("refuses to start before it has booted", async () => {
+	it("refuses to become ready before it has booted", async () => {
 		const provider = new BayProvider(app(["./nowhere"]) as never);
 		provider.register();
 
-		await expect(provider.start()).rejects.toThrow(/before boot\(\)/);
+		await expect(provider.ready()).rejects.toThrow(/before boot\(\)/);
 	});
 });
