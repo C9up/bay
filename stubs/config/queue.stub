@@ -1,0 +1,30 @@
+---
+to: config/queue.ts
+---
+import { defineConfig, drivers } from '@c9up/bay'
+import env from '#start/env'
+
+export default defineConfig({
+  // Which adapter to run on. Memory forgets everything on restart, which is
+  // what a single process in development wants and nothing else does.
+  default: env.get('QUEUE_DRIVER', 'memory'),
+
+  adapters: {
+    memory: drivers.memory(),
+    redis: drivers.redis({ connection: 'main' }),
+  },
+
+  // What the worker does between jobs: how long it waits after finding
+  // nothing, how often it reclaims jobs a crashed worker left behind, how many
+  // it runs at once, and which named queues it serves.
+  worker: {
+    idleDelay: 2_000,
+    stalledInterval: 30_000,
+    concurrency: 1,
+    // queues: ['critical', 'default'],
+  },
+
+  // Where the job classes live. Every module under here is imported at boot,
+  // so a worker resolves a queued record by the class's own name.
+  locations: ['app/jobs'],
+})
