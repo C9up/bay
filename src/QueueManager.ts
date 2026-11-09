@@ -206,7 +206,14 @@ export interface QueueDriver {
 	complete(job: JobRecord): Promise<void>;
 	retry(job: JobRecord): Promise<void>;
 	failed(): Promise<JobRecord[]>;
+	/** Jobs waiting on the default queue, delayed ones included. */
 	size(): Promise<number>;
+	/**
+	 * Jobs waiting on `queue`, delayed ones included. Optional for a driver
+	 * written before named queues; `QueueManager.sizeOf` then answers for the
+	 * default queue only.
+	 */
+	sizeOf?(queue: string): Promise<number>;
 	/**
 	 * Optional crash recovery: move jobs orphaned in the driver's 'processing'
 	 * state (expired visibility lease) back to pending, returning the count
@@ -761,8 +768,20 @@ export class QueueManager {
 		return this.#driver.failed();
 	}
 
-	/** Get queue size. */
+	/**
+	 * Jobs waiting on the default queue, delayed ones included — upstream's
+	 * `size()`. A named queue is {@link sizeOf}'s.
+	 */
 	async size(): Promise<number> {
 		return this.#driver.size();
+	}
+
+	/** Jobs waiting on `queue`, delayed ones included — upstream's `sizeOf`. */
+	async sizeOf(queue: string): Promise<number> {
+		if (this.#driver.sizeOf) return this.#driver.sizeOf(queue);
+		if (queue === DEFAULT_QUEUE) return this.#driver.size();
+		throw new Error(
+			`This queue driver has no sizeOf(), so it cannot count the '${queue}' queue`,
+		);
 	}
 }

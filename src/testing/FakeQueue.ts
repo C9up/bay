@@ -9,7 +9,8 @@
  * the fake into a runtime build.
  */
 
-import type { JobRecord, QueueDriver } from "../QueueManager.js";
+import { DEFAULT_QUEUE } from "../Job.js";
+import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
 
 export interface FakeQueuePredicate {
 	/** Custom payload predicate — receives the job's `payload` and
@@ -101,8 +102,16 @@ export class FakeQueue implements QueueDriver {
 			.map((j) => ({ ...j }));
 	}
 
+	/** Pending jobs on the default queue, like the real drivers. */
 	async size(): Promise<number> {
-		return this.#pushed.filter((j) => j.status === "pending").length;
+		return this.sizeOf(DEFAULT_QUEUE);
+	}
+
+	/** Pending jobs on `queue`. */
+	async sizeOf(queue: string): Promise<number> {
+		return this.#pushed.filter(
+			(j) => j.status === "pending" && queueOf(j) === queue,
+		).length;
 	}
 
 	/**

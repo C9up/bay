@@ -163,7 +163,7 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 			),
 		).toEqual(["now"]);
 		expect(await connection().zcard(`${prefix}q:emails:delayed`)).toBe(1);
-		expect(await driver.size("emails")).toBe(2);
+		expect(await driver.sizeOf("emails")).toBe(2);
 	});
 
 	it("does not settle a record it never took", async () => {

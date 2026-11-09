@@ -693,13 +693,18 @@ export class RedisDriver implements QueueDriver {
 		return jobs;
 	}
 
+	/** Jobs waiting on the default queue, delayed ones included. */
+	async size(): Promise<number> {
+		return this.sizeOf(DEFAULT_QUEUE);
+	}
+
 	/**
 	 * How many jobs are waiting on `queue` — its list plus its delayed set.
 	 *
 	 * A delayed job is queued; it is simply not due. Counting only the list
 	 * reported an empty queue to anything draining one before shutdown.
 	 */
-	async size(queue: string = DEFAULT_QUEUE): Promise<number> {
+	async sizeOf(queue: string): Promise<number> {
 		const client = await this.#client();
 		const waiting = await client.llen(this.#pendingKey(queue));
 		const delayed = await client.zcard(this.#delayedKey(queue));

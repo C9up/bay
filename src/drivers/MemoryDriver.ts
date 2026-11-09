@@ -88,14 +88,21 @@ export class MemoryDriver implements QueueDriver {
 	}
 
 	/**
-	 * Everything waiting, across every queue — a delayed job included.
-	 *
-	 * It is queued; it is simply not due. Leaving it out would report an empty
-	 * queue to anything draining one before shutdown.
+	 * The default queue, a delayed job included — the same answer the Redis
+	 * driver gives, so a check written against one holds against the other.
+	 * Counting every queue here made a drain-before-shutdown loop that passed
+	 * in tests wait on the wrong number in production.
 	 */
 	async size(): Promise<number> {
-		let total = this.#delayed.length;
-		for (const jobs of this.#pending.values()) total += jobs.length;
-		return total;
+		return this.sizeOf(DEFAULT_QUEUE);
+	}
+
+	/**
+	 * One queue, a delayed job included: it is queued, simply not due, and
+	 * leaving it out reports an empty queue to anything draining one.
+	 */
+	async sizeOf(queue: string): Promise<number> {
+		const delayed = this.#delayed.filter((job) => queueOf(job) === queue);
+		return (this.#pending.get(queue)?.length ?? 0) + delayed.length;
 	}
 }
