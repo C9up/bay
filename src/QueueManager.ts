@@ -1,10 +1,12 @@
 import {
 	checkJobOptions,
 	DEFAULT_QUEUE,
+	type Duration,
 	isJobClass,
 	Job,
 	type JobClass,
 	type JobOptions,
+	MAX_TIMEOUT,
 	toAttemptCount,
 	toMilliseconds,
 	toTimeout,
@@ -114,14 +116,52 @@ function withTimeout(
 }
 
 /**
+ * A delay between two polls, in milliseconds.
+ *
+ * Both end up in `setTimeout` or in a `>=` comparison, and `<= 0` alone let NaN
+ * through: as `idleDelay` it became a 1 ms busy loop against the backend, as
+ * `stalledInterval` it made the recovery check always false, so crash recovery
+ * ran once at startup and never again.
+ */
+function toPollDelay(value: Duration, label: string): number {
+	const ms = toMilliseconds(value, label);
+	if (!(ms > 0) || ms > MAX_TIMEOUT) {
+		throw new Error(
+			`${label} must be a delay from 1 to ${MAX_TIMEOUT} ms, got ${String(value)}`,
+		);
+	}
+	return ms;
+}
+
+/** A queue list that serves something, each name non-empty. */
+function checkQueues(
+	queues: readonly string[] | undefined,
+): readonly string[] | undefined {
+	if (queues === undefined) return undefined;
+	if (queues.length === 0) {
+		throw new Error(
+			"queues must name at least one queue; leave it out to serve the default one",
+		);
+	}
+	for (const name of queues) {
+		if (typeof name !== "string" || name.trim().length === 0) {
+			throw new Error(
+				`queues must hold non-empty names, got ${JSON.stringify(queues)}`,
+			);
+		}
+	}
+	return queues;
+}
+
+/**
  * What a worker is told before it starts, by upstream's names for it
  * (`WorkerConfig.idleDelay`, `WorkerConfig.stalledInterval`).
  */
 export interface WorkerOptions {
 	/** Milliseconds to wait after finding nothing to do. Default `2000`. */
-	idleDelay?: number;
+	idleDelay?: Duration;
 	/** Milliseconds between stalled-job sweeps. Default `30_000`. */
-	stalledInterval?: number;
+	stalledInterval?: Duration;
 	/**
 	 * How many jobs this worker runs at once. Default `1`.
 	 *
@@ -566,24 +606,27 @@ export class QueueManager {
 					defaults.stalledInterval ??
 					stalledIntervalArg);
 
-		if (idleDelay <= 0) {
-			throw new Error("idleDelay must be positive");
-		}
-		if (stalledInterval <= 0) {
-			throw new Error("stalledInterval must be positive");
-		}
+		const idleDelayMs = toPollDelay(idleDelay, "idleDelay");
+		const stalledIntervalMs = toPollDelay(stalledInterval, "stalledInterval");
 		const concurrency =
 			asOptions?.concurrency ?? this.#workerDefaults.concurrency ?? 1;
 		if (!Number.isInteger(concurrency) || concurrency < 1) {
 			throw new Error("concurrency must be a whole number >= 1");
 		}
-		const queues = asOptions?.queues ?? this.#workerDefaults.queues;
+		const queues = checkQueues(
+			asOptions?.queues ?? this.#workerDefaults.queues,
+		);
 
 		if (this.#running) {
 			throw new Error("QueueManager is already running");
 		}
 		this.#running = true;
-		const loop = this.#loop(idleDelay, stalledInterval, concurrency, queues);
+		const loop = this.#loop(
+			idleDelayMs,
+			stalledIntervalMs,
+			concurrency,
+			queues,
+		);
 		this.#loopPromise = loop;
 		try {
 			await loop;

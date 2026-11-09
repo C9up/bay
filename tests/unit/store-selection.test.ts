@@ -168,7 +168,7 @@ describe("bay > the worker block", () => {
 		// A `stalledInterval` the manager refuses is the observable proof it read
 		// the block: nothing else would make `work()` reject.
 		await expect(manager.work()).rejects.toThrow(
-			/stalledInterval must be positive/,
+			/stalledInterval must be a delay from 1/,
 		);
 	});
 

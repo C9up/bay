@@ -183,8 +183,8 @@ describe("bay > QueueManager > processOne", () => {
 describe("bay > QueueManager > work / stop", () => {
 	it("rejects idleDelay <= 0 (would busy-loop)", async () => {
 		const q = new QueueManager(new CapturingDriver());
-		await expect(q.work(0)).rejects.toThrow(/idleDelay must be positive/);
-		await expect(q.work(-1)).rejects.toThrow(/idleDelay must be positive/);
+		await expect(q.work(0)).rejects.toThrow(/idleDelay must be a delay from 1/);
+		await expect(q.work(-1)).rejects.toThrow(/idleDelay/);
 	});
 
 	it("refuses to start a second concurrent work() loop", async () => {
@@ -429,7 +429,7 @@ describe("bay > the worker options carry upstream's names", () => {
 	it("rejects a stalledInterval that is not positive", async () => {
 		const queue = new QueueManager(new CapturingDriver());
 		await expect(queue.work({ stalledInterval: 0 })).rejects.toThrow(
-			/stalledInterval must be positive/,
+			/stalledInterval must be a delay from 1/,
 		);
 	});
 
