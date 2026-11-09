@@ -4,6 +4,7 @@
 
 import { DEFAULT_QUEUE } from "../Job.js";
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
+import { snapshot } from "../record.js";
 
 export class MemoryDriver implements QueueDriver {
 	/** One list per named queue, created on first use. */
@@ -43,13 +44,20 @@ export class MemoryDriver implements QueueDriver {
 		}
 	}
 
+	/**
+	 * Stored as a JSON copy, the way Redis stores it. By reference, a dispatcher
+	 * that changed its object after dispatch changed the queued job, and a Date
+	 * or a BigInt survived here and nowhere else — tests passed on behaviour
+	 * production does not have.
+	 */
 	async push(job: JobRecord): Promise<void> {
-		if (job.runAt !== undefined && job.runAt > Date.now()) {
-			this.#delayed.push(job);
+		const stored = snapshot(job);
+		if (stored.runAt !== undefined && stored.runAt > Date.now()) {
+			this.#delayed.push(stored);
 			this.#delayed.sort((a, b) => (a.runAt ?? 0) - (b.runAt ?? 0));
 			return;
 		}
-		this.#queue(queueOf(job)).push(job);
+		this.#queue(queueOf(stored)).push(stored);
 	}
 
 	async pop(
@@ -68,7 +76,7 @@ export class MemoryDriver implements QueueDriver {
 	async fail(job: JobRecord, error: string): Promise<void> {
 		job.error = error;
 		job.status = "failed";
-		this.#failedJobs.push(job);
+		this.#failedJobs.push(snapshot(job));
 		if (this.#failedJobs.length > this.#maxFailedJobs) {
 			this.#failedJobs.splice(0, this.#failedJobs.length - this.#maxFailedJobs);
 		}
@@ -85,7 +93,7 @@ export class MemoryDriver implements QueueDriver {
 	}
 
 	async failed(): Promise<JobRecord[]> {
-		return [...this.#failedJobs];
+		return this.#failedJobs.map(snapshot);
 	}
 
 	/**

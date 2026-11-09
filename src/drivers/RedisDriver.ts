@@ -22,6 +22,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_QUEUE } from "../Job.js";
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
+import { parseJob, type Unreadable } from "../record.js";
 
 /**
  * The commands this driver issues. ioredis and a `@c9up/quasar` connection
@@ -64,56 +65,6 @@ export interface RedisDriverOptions {
 	maxStalledCount?: number;
 	/** How many failed jobs to keep. Default `1000`. `0` keeps every one. */
 	maxFailedJobs?: number;
-}
-
-function isValidJob(obj: unknown): obj is JobRecord {
-	if (typeof obj !== "object" || obj === null) return false;
-	const maxAttempts: unknown = Reflect.get(obj, "maxAttempts");
-	return (
-		typeof Reflect.get(obj, "id") === "string" &&
-		typeof Reflect.get(obj, "name") === "string" &&
-		typeof Reflect.get(obj, "attempts") === "number" &&
-		typeof maxAttempts === "number" &&
-		Number.isSafeInteger(maxAttempts) &&
-		maxAttempts >= 1 &&
-		typeof Reflect.get(obj, "status") === "string"
-	);
-}
-
-/** What can be read off a record that cannot run. */
-interface Unreadable {
-	reason: string;
-	id?: string;
-	name?: string;
-	queue?: string;
-}
-
-type Parsed = { ok: true; job: JobRecord } | ({ ok: false } & Unreadable);
-
-function stringField(obj: object, key: string): string | undefined {
-	const value: unknown = Reflect.get(obj, key);
-	return typeof value === "string" ? value : undefined;
-}
-
-/** Read a stored record, saying what is wrong with one that cannot run. */
-function parseJob(raw: string): Parsed {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch {
-		return { ok: false, reason: "not JSON" };
-	}
-	if (isValidJob(parsed)) return { ok: true, job: parsed };
-	if (typeof parsed !== "object" || parsed === null) {
-		return { ok: false, reason: "not an object" };
-	}
-	return {
-		ok: false,
-		reason: "not a job record (id, name, attempts, maxAttempts >= 1, status)",
-		id: stringField(parsed, "id"),
-		name: stringField(parsed, "name"),
-		queue: stringField(parsed, "queue"),
-	};
 }
 
 /** A script, with the digest `EVALSHA` addresses it by. */
