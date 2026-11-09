@@ -81,13 +81,13 @@ describe("bay > QueueManager > processOne", () => {
 		);
 	});
 
-	it("fails the job (no retry) when no handler is registered for its name", async () => {
+	it("fails the job at once when no handler is registered and unknownJobRetries is 0", async () => {
 		const driver = new CapturingDriver();
 		const stderrSpy = vi
 			.spyOn(process.stderr, "write")
-			.mockImplementation((() => true) as never);
+			.mockImplementation(() => true);
 		try {
-			const q = new QueueManager(driver);
+			const q = new QueueManager(driver, { unknownJobRetries: 0 });
 			await q.dispatch("missing-handler", null);
 			expect(await q.processOne()).toBe(true);
 			expect(driver.failArgs).toHaveLength(1);

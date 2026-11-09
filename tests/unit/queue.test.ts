@@ -57,12 +57,22 @@ describe("queue > MemoryDriver", () => {
 		expect(defined(failed[0]).status).toBe("failed");
 	});
 
-	it("fails immediately when no handler is registered for the job name", async () => {
-		await queue.dispatch("unknown.job", { x: 1 });
-		await queue.processOne();
-		const failed = await queue.failedJobs();
+	it("fails immediately when no handler is registered and unknown jobs are not waited for", async () => {
+		const strict = new QueueManager(new MemoryDriver(), {
+			unknownJobRetries: 0,
+		});
+		await strict.dispatch("unknown.job", { x: 1 });
+		await strict.processOne();
+		const failed = await strict.failedJobs();
 		expect(failed).toHaveLength(1);
 		expect(defined(failed[0]).error).toContain("No handler");
+	});
+
+	it("puts a job no handler answers to back instead, by default", async () => {
+		await queue.dispatch("unknown.job", { x: 1 });
+		await queue.processOne();
+		expect(await queue.failedJobs()).toEqual([]);
+		expect(await queue.size()).toBe(1);
 	});
 
 	it("accepts class-based handlers", async () => {

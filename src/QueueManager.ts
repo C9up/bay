@@ -42,6 +42,12 @@ export interface JobRecord {
 	 */
 	stalledCount?: number;
 	/**
+	 * How many times a worker took this job without anything answering to
+	 * its name. Kept apart from `attempts`, which counts handler runs: a job
+	 * that waited out a rolling deploy has not spent any of them.
+	 */
+	unknownCount?: number;
+	/**
 	 * Named queue this job waits in. A worker is told which queues to serve, so
 	 * a slow queue cannot starve a fast one sharing the same process.
 	 *
@@ -139,6 +145,19 @@ function toPollDelay(value: Duration, label: string): number {
 	return ms;
 }
 
+/** Upstream's wait before a job nothing answers to is looked at again. */
+const UNKNOWN_JOB_RETRY_DELAY = 30_000;
+
+function toUnknownJobRetries(value: number | undefined): number {
+	if (value === undefined) return 10;
+	if (!Number.isSafeInteger(value) || value < 0) {
+		throw new Error(
+			`unknownJobRetries must be a whole number >= 0, got ${value}`,
+		);
+	}
+	return value;
+}
+
 /** A queue list that serves something, each name non-empty. */
 function checkQueues(
 	queues: readonly string[] | undefined,
@@ -184,6 +203,13 @@ export interface WorkerOptions {
 	 * taking whatever comes.
 	 */
 	queues?: readonly string[];
+	/**
+	 * How many times a job nothing answers to is put back — 30 s later — before
+	 * it is failed. Default `10`, upstream's. During a rolling deploy the new
+	 * HTTP processes dispatch jobs the old workers do not know yet; failing
+	 * them on first sight dropped every one into the failed list.
+	 */
+	unknownJobRetries?: number;
 }
 
 /**
@@ -288,6 +314,8 @@ export class QueueManager {
 
 	/** Defaults for `work()`, from the config's `worker` block. */
 	readonly #workerDefaults: WorkerOptions;
+	/** The worker block's, or the running `work()` call's when it names one. */
+	#unknownJobRetries: number;
 
 	readonly #jobFactory: JobFactory;
 
@@ -298,6 +326,9 @@ export class QueueManager {
 	) {
 		this.#driver = driver;
 		this.#workerDefaults = workerDefaults ?? {};
+		this.#unknownJobRetries = toUnknownJobRetries(
+			this.#workerDefaults.unknownJobRetries,
+		);
 		this.#jobFactory = options?.jobFactory ?? ((cls) => new cls());
 	}
 
@@ -420,6 +451,17 @@ export class QueueManager {
 	async #attempt(job: JobRecord): Promise<void> {
 		const target = this.#lookup(job.name);
 		if (!target) {
+			const seen = job.unknownCount ?? 0;
+			if (seen < this.#unknownJobRetries) {
+				job.unknownCount = seen + 1;
+				job.status = "pending";
+				job.runAt = Date.now() + UNKNOWN_JOB_RETRY_DELAY;
+				process.stderr.write(
+					`QueueManager: no handler registered for job '${job.name}' yet — putting it back for ${UNKNOWN_JOB_RETRY_DELAY / 1000}s (${seen + 1}/${this.#unknownJobRetries})\n`,
+				);
+				await this.#driver.retry(job);
+				return;
+			}
 			process.stderr.write(
 				`QueueManager: no handler registered for job '${job.name}'\n`,
 			);
@@ -642,6 +684,11 @@ export class QueueManager {
 			asOptions?.concurrency ?? this.#workerDefaults.concurrency ?? 1;
 		if (!Number.isInteger(concurrency) || concurrency < 1) {
 			throw new Error("concurrency must be a whole number >= 1");
+		}
+		if (asOptions?.unknownJobRetries !== undefined) {
+			this.#unknownJobRetries = toUnknownJobRetries(
+				asOptions.unknownJobRetries,
+			);
 		}
 		const queues = checkQueues(
 			asOptions?.queues ?? this.#workerDefaults.queues,

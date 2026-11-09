@@ -134,8 +134,14 @@ for.
 The `worker` block carries the framework's names for what a worker does between
 jobs — `idleDelay` (how long it waits after finding nothing, 2 s),
 `stalledInterval` (how often it reclaims what a crashed worker left behind,
-30 s), `concurrency` and `queues`. An argument to `work()` beats the block, and
-the block beats the defaults.
+30 s), `concurrency`, `queues` and `unknownJobRetries`. An argument to `work()`
+beats the block, and the block beats the defaults.
+
+A job nothing answers to yet — dispatched by a new HTTP process before the old
+workers were replaced — is put back for 30 s rather than failed, up to
+`unknownJobRetries` times (10 by default, `0` to fail it at once). Those
+sightings are not attempts: a job that waited out a deploy still has all of its
+`maxRetries` left.
 
 `locations` says where the job classes live (`['app/jobs']` by default). Every
 module under them is imported at boot and a default export that is a job class
