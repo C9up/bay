@@ -106,7 +106,10 @@ describe("bay > QueueManager > processOne", () => {
 		q.register("email", handler);
 		await q.dispatch("email", { id: 42 });
 		expect(await q.processOne()).toBe(true);
-		expect(handler.handle).toHaveBeenCalledWith({ id: 42 });
+		expect(handler.handle).toHaveBeenCalledWith(
+			{ id: 42 },
+			expect.any(AbortSignal),
+		);
 		expect(driver.completed).toHaveLength(1);
 		expect(driver.completed[0]?.status).toBe("completed");
 	});

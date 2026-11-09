@@ -56,7 +56,12 @@ export function queueOf(job: JobRecord): string {
 }
 
 export interface JobHandler {
-	handle(payload: unknown): Promise<void>;
+	/**
+	 * `signal` aborts when the attempt's `timeout` passes. Nothing in Node can
+	 * stop a running promise from outside, so a handler that wants to stop on
+	 * time listens to it — and the worker slot stays taken until it returns.
+	 */
+	handle(payload: unknown, signal: AbortSignal): Promise<void>;
 }
 
 /**
@@ -67,32 +72,33 @@ export interface JobHandler {
  * shapes.
  */
 interface JobRunner {
-	run(payload: unknown): Promise<void> | void;
+	run(payload: unknown, signal: AbortSignal): Promise<void> | void;
 	onFailed?(error: Error): Promise<void> | void;
 }
 
 /**
- * Reject once `ms` has passed, without touching the work.
+ * Reject once `ms` has passed, aborting `controller` so the work can stop.
  *
- * Nothing in Node can interrupt a running promise, so a job that ignores its
- * timeout goes on burning CPU. What this buys is that the WORKER stops waiting
- * for it — otherwise one stuck job costs the whole worker, which never picks
- * anything up again.
+ * The work itself is not interrupted — nothing in Node can do that to a
+ * promise. What the abort buys is a handler that listens to its signal and
+ * returns; what the rejection buys is that the attempt is settled on time.
  */
 function withTimeout(
-	work: Promise<void> | void,
+	work: Promise<void>,
 	ms: number | undefined,
 	name: string,
+	controller: AbortController,
 ): Promise<void> {
-	const settled = Promise.resolve(work);
-	if (ms === undefined || ms <= 0) return settled;
+	if (ms === undefined || ms <= 0) return work;
 	return new Promise<void>((resolve, reject) => {
 		const timer = setTimeout(() => {
-			reject(new Error(`Job '${name}' exceeded its ${ms}ms timeout`));
+			const error = new Error(`Job '${name}' exceeded its ${ms}ms timeout`);
+			controller.abort(error);
+			reject(error);
 		}, ms);
 		// Unreffed: a pending timeout must not be the reason the process stays up.
 		timer.unref();
-		settled.then(
+		work.then(
 			(value) => {
 				clearTimeout(timer);
 				resolve(value);
@@ -330,9 +336,12 @@ export class QueueManager {
 		// the same mechanism a heartbeat (`Adapter.renewJobs`); a driver without
 		// a lease supplies no cadence and nothing is scheduled.
 		const stopRenewing = this.#startRenewing(job);
+		const controller = new AbortController();
+		let execution: Promise<void> | undefined;
 		let handled = false;
 		try {
-			await withTimeout(handler.run(job.payload), job.timeout, job.name);
+			execution = Promise.resolve(handler.run(job.payload, controller.signal));
+			await withTimeout(execution, job.timeout, job.name, controller);
 			handled = true;
 		} catch (err) {
 			const error = err instanceof Error ? err : new Error(String(err));
@@ -374,6 +383,14 @@ export class QueueManager {
 			await this.#driver.complete(job);
 		}
 
+		// A timed-out attempt is settled, but its handler may still be running.
+		// Returning now would free this worker's slot while it does, and the
+		// retry could start beside it: concurrency 1 was measured running four
+		// attempts of one job at once. Upstream waits for it the same way.
+		if (controller.signal.aborted && execution !== undefined) {
+			await execution.catch(() => {});
+		}
+
 		return true;
 	}
 
@@ -390,19 +407,23 @@ export class QueueManager {
 				typeof handlerOrClass === "function"
 					? new handlerOrClass()
 					: handlerOrClass;
-			return { run: (payload) => handler.handle(payload) };
+			return { run: (payload, signal) => handler.handle(payload, signal) };
 		}
 		const JobConstructor = this.#jobs.get(name);
 		if (JobConstructor === undefined) return undefined;
 		const instance = new JobConstructor();
 		return {
-			run: (payload) => {
-				// `payload` is declared readonly on the class so a handler cannot
-				// rewrite what it was sent; it is assigned once, here.
+			run: (payload, signal) => {
+				// `payload` and `signal` are declared readonly on the class so a
+				// handler cannot rewrite them; they are assigned once, here.
 				Object.defineProperty(instance, "payload", {
 					value: payload,
 					configurable: true,
 					enumerable: true,
+				});
+				Object.defineProperty(instance, "signal", {
+					value: signal,
+					configurable: true,
 				});
 				return instance.execute();
 			},

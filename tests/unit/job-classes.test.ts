@@ -216,11 +216,11 @@ describe("bay > a delayed job", () => {
 });
 
 describe("bay > a job that takes too long", () => {
-	it("fails the attempt instead of holding the worker", async () => {
+	it("settles the attempt on time, then waits for the handler before freeing the slot", async () => {
 		let finished = false;
 		class Slow extends Job {
 			async execute(): Promise<void> {
-				await new Promise((resolve) => setTimeout(resolve, 500));
+				await new Promise((resolve) => setTimeout(resolve, 300));
 				finished = true;
 			}
 		}
@@ -228,14 +228,16 @@ describe("bay > a job that takes too long", () => {
 		const queue = new QueueManager(driver);
 
 		await queue.dispatch(Slow, {}, { timeout: 20, maxAttempts: 1 });
-		const started = Date.now();
-		expect(await queue.processOne()).toBe(true);
+		const processing = queue.processOne();
+		await new Promise((resolve) => setTimeout(resolve, 100));
 
-		// The worker stopped waiting; the handler itself is not interruptible.
-		expect(Date.now() - started).toBeLessThan(400);
-		expect(finished).toBe(false);
+		// Filed as failed at its deadline, while the handler is still going.
 		const failed = await driver.failed();
 		expect(failed[0]?.error).toMatch(/exceeded its 20ms timeout/);
+		expect(finished).toBe(false);
+
+		expect(await processing).toBe(true);
+		expect(finished).toBe(true);
 	});
 
 	it("lets a job inside its timeout through untouched", async () => {

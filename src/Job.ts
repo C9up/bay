@@ -49,12 +49,11 @@ export interface JobOptions {
 	delay?: Duration;
 	/**
 	 * How long the handler gets. Past it the attempt is a failure and the job
-	 * retries or fails like any other.
+	 * retries or fails like any other, and `this.signal` is aborted.
 	 *
 	 * The handler is not killed — nothing in Node can interrupt a running
-	 * promise — so a job that ignores its timeout goes on burning CPU. What the
-	 * timeout buys is that the WORKER stops waiting for it, which is what a
-	 * stuck job otherwise costs: a worker that never picks anything up again.
+	 * promise — so it has to listen to its signal to stop. Until it returns it
+	 * keeps its worker slot, so `concurrency` stays a bound on what runs.
 	 */
 	timeout?: Duration;
 }
@@ -75,6 +74,13 @@ export abstract class Job<Payload = unknown> {
 
 	/** What `dispatch` was given, as the class declared it. */
 	declare readonly payload: Payload;
+
+	/**
+	 * Aborted when the attempt's `timeout` passes. Hand it to the I/O the job
+	 * does (`fetch(url, { signal: this.signal })`) or check `aborted` between
+	 * steps: the worker slot stays taken until `execute()` returns.
+	 */
+	declare readonly signal: AbortSignal;
 
 	/** Do the work. Throwing is what makes the attempt fail. */
 	abstract execute(): Promise<void> | void;
