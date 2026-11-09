@@ -286,6 +286,38 @@ describe("bay > a worker running several at once", () => {
 		// waits: four jobs of 40ms would take 160ms in sequence.
 		expect(peak).toBeGreaterThan(1);
 	});
+
+	it("refills a slot the moment its job ends, instead of waiting for the slowest of a round", async () => {
+		const started = Date.now();
+		const done: [string, number][] = [];
+		const queue = new QueueManager(new MemoryDriver());
+		queue.register("job", {
+			async handle(payload) {
+				const ms = payload === "slow" ? 250 : 10;
+				await new Promise((resolve) => setTimeout(resolve, ms));
+				done.push([String(payload), Date.now() - started]);
+			},
+		});
+		await queue.dispatch("job", "slow");
+		for (let i = 0; i < 5; i++) await queue.dispatch("job", "fast");
+
+		const running = queue.work({ concurrency: 2, idleDelay: 5 });
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		await queue.stop();
+		await running;
+
+		// Five fast jobs through the free slot while the slow one runs.
+		expect(done.map(([name]) => name)).toEqual([
+			"fast",
+			"fast",
+			"fast",
+			"fast",
+			"fast",
+			"slow",
+		]);
+		const lastFast = done[4]?.[1] ?? Number.POSITIVE_INFINITY;
+		expect(lastFast).toBeLessThan(150);
+	});
 });
 
 describe("bay > make:job", () => {

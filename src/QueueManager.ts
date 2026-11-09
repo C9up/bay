@@ -271,7 +271,7 @@ export class QueueManager {
 	/** Cuts the sleep between polls short. */
 	#wake: (() => void) | undefined;
 	/** Every attempt currently in flight, so `drain()` can wait for all of them. */
-	#inflight: Set<Promise<boolean>> = new Set();
+	#inflight: Set<Promise<void>> = new Set();
 
 	/** Defaults for `work()`, from the config's `worker` block. */
 	readonly #workerDefaults: WorkerOptions;
@@ -393,7 +393,12 @@ export class QueueManager {
 	async processOne(queues?: readonly string[]): Promise<boolean> {
 		const job = await this.#driver.pop(queues);
 		if (!job) return false;
+		await this.#attempt(job);
+		return true;
+	}
 
+	/** Run one attempt of a job already taken from the driver. */
+	async #attempt(job: JobRecord): Promise<void> {
 		const target = this.#lookup(job.name);
 		if (!target) {
 			process.stderr.write(
@@ -403,7 +408,7 @@ export class QueueManager {
 				job,
 				`No handler registered for job: ${job.name}`,
 			);
-			return true;
+			return;
 		}
 
 		job.attempts++;
@@ -476,8 +481,6 @@ export class QueueManager {
 		if (controller.signal.aborted && execution !== undefined) {
 			await execution.catch(() => {});
 		}
-
-		return true;
 	}
 
 	/**
@@ -651,37 +654,50 @@ export class QueueManager {
 	): Promise<void> {
 		await this.#tryRecoverStale();
 		let lastRecover = Date.now();
+		// A pool, not rounds: a slot is refilled the moment its job ends.
+		// Waiting for a whole round left every other slot idle behind the
+		// slowest job in it, and mixed workloads ran at a concurrency near 1.
+		const pool = new Set<Promise<void>>();
 		while (this.#running) {
-			// One round of up to `concurrency` jobs. `allSettled`, not `all`: a
-			// driver that throws for one job must not abandon the others
-			// mid-flight, and each attempt already reports its own failure.
-			const round = Array.from({ length: concurrency }, () =>
-				this.processOne(queues),
-			);
-			for (const attempt of round) this.#inflight.add(attempt);
-			const outcomes = await Promise.allSettled(round);
-			for (const attempt of round) this.#inflight.delete(attempt);
-
-			let processed = false;
-			for (const outcome of outcomes) {
-				if (outcome.status === "fulfilled") {
-					processed = processed || outcome.value;
-				} else {
-					const err = outcome.reason;
-					process.stderr.write(
-						`QueueManager processOne error: ${err instanceof Error ? err.message : String(err)}\n`,
-					);
+			let empty = false;
+			while (this.#running && pool.size < concurrency) {
+				let job: JobRecord | null;
+				try {
+					job = await this.#driver.pop(queues);
+				} catch (err) {
+					this.#report(err);
+					empty = true;
+					break;
 				}
+				if (!job) {
+					empty = true;
+					break;
+				}
+				const attempt: Promise<void> = this.#attempt(job)
+					.catch((err: unknown) => this.#report(err))
+					.finally(() => {
+						pool.delete(attempt);
+						this.#inflight.delete(attempt);
+					});
+				pool.add(attempt);
+				this.#inflight.add(attempt);
 			}
-			// Nothing anywhere means the queues are empty; anything at all means
-			// there may be more behind it, so ask again without waiting.
-			if (!processed) await this.#sleep(idleDelay);
+			if (!this.#running) break;
 
-			if (this.#running && Date.now() - lastRecover >= stalledInterval) {
+			if (Date.now() - lastRecover >= stalledInterval) {
 				await this.#tryRecoverStale();
 				lastRecover = Date.now();
 			}
+			// Full: wait for a slot. Nothing to take: wait before asking again.
+			if (pool.size >= concurrency) await Promise.race(pool);
+			else if (empty) await this.#sleep(idleDelay);
 		}
+	}
+
+	#report(err: unknown): void {
+		process.stderr.write(
+			`QueueManager processOne error: ${err instanceof Error ? err.message : String(err)}\n`,
+		);
 	}
 
 	/** Wait, unless `stop()` says otherwise first. */
