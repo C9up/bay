@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	type RedisClient,
 	RedisDriver,
@@ -220,6 +220,50 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 		expect(scripted.filter((c) => c === "eval").length).toBeLessThanOrEqual(1);
 		expect(scripted[0]).toBe("evalsha");
 		expect(scripted.at(-1)).toBe("evalsha");
+	});
+
+	for (const [label, raw] of [
+		["unparseable JSON", "not json at all"],
+		["JSON that is not a job", JSON.stringify({ nope: true })],
+		[
+			"a job whose maxAttempts was lost in serialisation",
+			JSON.stringify({ ...makeJob({ id: "inf" }), maxAttempts: null }),
+		],
+	] as const) {
+		it(`files ${label} as failed instead of deleting it`, async () => {
+			const { driver, prefix } = await driverFor("unreadable");
+			const stderr = vi
+				.spyOn(process.stderr, "write")
+				.mockImplementation(() => true);
+			try {
+				await connection().rpush(`${prefix}pending`, raw);
+				await driver.push(makeJob({ id: "good" }));
+
+				// The bad entry is filed and the next job taken in the same call.
+				expect((await driver.pop())?.id).toBe("good");
+				expect(stderr).toHaveBeenCalledWith(
+					expect.stringMatching(/unreadable job record/),
+				);
+			} finally {
+				stderr.mockRestore();
+			}
+
+			const failed = await driver.failed();
+			expect(failed).toHaveLength(1);
+			expect(failed[0]?.payload).toBe(raw);
+			expect(failed[0]?.error).toMatch(/Unreadable job record/);
+			expect(await connection().llen(`${prefix}processing`)).toBe(1);
+		});
+	}
+
+	it("files an unreadable entry found in processing as failed too", async () => {
+		const { driver, prefix } = await driverFor("unreadable-processing");
+		await connection().rpush(`${prefix}processing`, "garbage");
+		expect(await driver.recoverStale()).toBe(0);
+		expect((await driver.failed()).map((job) => job.payload)).toEqual([
+			"garbage",
+		]);
+		expect(await connection().llen(`${prefix}processing`)).toBe(0);
 	});
 
 	it("resolves a named quasar connection lazily", async () => {

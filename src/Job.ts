@@ -104,6 +104,37 @@ export function isJobClass(value: unknown): value is JobClass {
 }
 
 /**
+ * A count of runs: a whole number from 1 up.
+ *
+ * `< 1` alone let `Infinity`, `NaN` and `1.5` through. Infinity serialises as
+ * `null`, which a Redis worker cannot read back, and in memory it retried a
+ * failing job forever; NaN made the first failure final.
+ */
+export function toAttemptCount(value: number, label: string): number {
+	if (!Number.isSafeInteger(value) || value < 1) {
+		throw new Error(`${label} must be a whole number >= 1, got ${value}`);
+	}
+	return value;
+}
+
+/**
+ * Check what a job class declares, so a class that cannot be run is refused at
+ * registration — at boot — rather than on every dispatch.
+ */
+export function checkJobOptions(job: JobClass): void {
+	const options = job.options ?? {};
+	try {
+		if (options.maxRetries !== undefined) {
+			toAttemptCount(options.maxRetries, "maxRetries");
+		}
+	} catch (err) {
+		throw new Error(
+			`[bay] job '${job.name}': ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+}
+
+/**
  * Milliseconds from a number or a duration string.
  *
  * `'10s'`, `'1m'`, `'2h'`, `'500ms'`, `'1d'` — the spellings a config file

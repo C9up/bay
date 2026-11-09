@@ -69,7 +69,7 @@ describe("bay > QueueManager > dispatch", () => {
 		const driver = new CapturingDriver();
 		const q = new QueueManager(driver);
 		await expect(q.dispatch("x", null, { maxAttempts: 0 })).rejects.toThrow(
-			/maxAttempts must be >= 1/,
+			/maxAttempts must be a whole number >= 1/,
 		);
 	});
 });

@@ -1,8 +1,10 @@
 import {
+	checkJobOptions,
 	DEFAULT_QUEUE,
 	isJobClass,
 	type JobClass,
 	type JobOptions,
+	toAttemptCount,
 	toMilliseconds,
 } from "./Job.js";
 
@@ -211,6 +213,7 @@ export class QueueManager {
 	 * process runs jobs and an HTTP process queues them.
 	 */
 	registerJob(job: JobClass): void {
+		checkJobOptions(job);
 		this.#jobs.set(job.name, job);
 	}
 
@@ -251,6 +254,7 @@ export class QueueManager {
 		let name: string;
 		let declared: JobOptions = {};
 		if (isJobClass(job)) {
+			checkJobOptions(job);
 			name = job.name;
 			declared = job.options ?? {};
 			// So a worker that never dispatches still resolves it by name.
@@ -260,12 +264,15 @@ export class QueueManager {
 		}
 
 		// The call site wins over the class, and the class over the defaults —
-		// the same order `work()` reads its own options in.
+		// the same order `work()` reads its own options in. Each spelling is
+		// checked under its own name, so the message names what was written.
 		const maxAttempts =
-			options.maxAttempts ?? options.maxRetries ?? declared.maxRetries ?? 3;
-		if (maxAttempts < 1) {
-			throw new Error("maxAttempts must be >= 1");
-		}
+			options.maxAttempts !== undefined
+				? toAttemptCount(options.maxAttempts, "maxAttempts")
+				: toAttemptCount(
+						options.maxRetries ?? declared.maxRetries ?? 3,
+						"maxRetries",
+					);
 		const delay = options.delay ?? declared.delay;
 		const delayMs = delay === undefined ? 0 : toMilliseconds(delay, "delay");
 		const timeout = options.timeout ?? declared.timeout;
