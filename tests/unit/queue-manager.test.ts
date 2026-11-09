@@ -227,7 +227,7 @@ describe("bay > QueueManager > work / stop", () => {
 		};
 		const stderrSpy = vi
 			.spyOn(process.stderr, "write")
-			.mockImplementation((() => true) as never);
+			.mockImplementation(() => true);
 		try {
 			const q = new QueueManager(driver);
 			const looping = q.work(5);

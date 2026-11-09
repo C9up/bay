@@ -16,21 +16,25 @@ import { defined } from "../__helpers__/defined.js";
  * older `stores` spelling on purpose: it is still accepted, and a config
  * written against it must keep selecting the backend it named.
  */
-function managerFrom(config: BayProviderConfig | undefined): QueueManager {
+function managerFrom(config: unknown): QueueManager {
 	const bindings = new Map<unknown, () => unknown>();
 	const app: BayAppContext = {
 		container: {
 			singleton(token: unknown, factory: () => unknown) {
 				bindings.set(token, factory);
 			},
-			async resolve<T>(token: unknown): Promise<T> {
-				return defined(bindings.get(token))() as T;
+			async resolve(token: unknown): Promise<unknown> {
+				return defined(bindings.get(token))();
 			},
 		},
-		config: { get: <T>() => config as T },
+		config: { get: () => config },
 	};
 	new BayProvider(app).register();
-	return bindings.get(QueueManager)?.() as QueueManager;
+	const manager = bindings.get(QueueManager)?.();
+	if (!(manager instanceof QueueManager)) {
+		throw new Error("expected the provider to bind a QueueManager");
+	}
+	return manager;
 }
 
 describe("bay > store selection", () => {
@@ -82,9 +86,9 @@ describe("bay > store selection", () => {
 	});
 
 	it("points a non-memory `driver` at the adapters form", () => {
-		expect(() =>
-			managerFrom({ driver: "redis" as BayProviderConfig["driver"] }),
-		).toThrow(/name it under `adapters`/);
+		expect(() => managerFrom({ driver: "redis" })).toThrow(
+			/name it under `adapters`/,
+		);
 	});
 
 	it("hands each factory its options", () => {
@@ -205,11 +209,11 @@ describe("bay > the token the framework namespaces", () => {
 						return built.get(token);
 					});
 				},
-				async resolve<T>(token: unknown): Promise<T> {
-					return defined(bindings.get(token))() as T;
+				async resolve(token: unknown): Promise<unknown> {
+					return defined(bindings.get(token))();
 				},
 			},
-			config: { get: <T>() => config as T },
+			config: { get: () => config },
 		};
 		new BayProvider(app).register();
 		return bindings;

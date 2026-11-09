@@ -97,7 +97,7 @@ describe("queue > MemoryDriver", () => {
 		const seen: number[] = [];
 		queue.register("burst", {
 			async handle(payload) {
-				seen.push((payload as { i: number }).i);
+				seen.push(Number(Reflect.get(Object(payload), "i")));
 			},
 		});
 		await Promise.all(

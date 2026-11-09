@@ -35,7 +35,10 @@ export function clearQueue(): void {
 	instance = undefined;
 }
 
-const queue: QueueManager = new Proxy({} as QueueManager, {
+// The target is never read through — every trap forwards to `instance`.
+const target: QueueManager = Object.create(null);
+
+const queue: QueueManager = new Proxy(target, {
 	get(_target, prop) {
 		// A module loader inspects what it imports before anyone uses it: it reads
 		// `then` to decide whether the namespace is thenable, and various symbols

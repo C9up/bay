@@ -67,7 +67,7 @@ async function walk(dir: string, depth = 0): Promise<string[]> {
 		// denial, a broken mount or a path pointing at a file produced a worker
 		// with no handlers and nothing said — the queue accepted jobs and
 		// processed none of them.
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+		if (Reflect.get(Object(err), "code") === "ENOENT") return [];
 		throw new Error(
 			`[bay] cannot read the jobs directory '${dir}': ${
 				err instanceof Error ? err.message : String(err)

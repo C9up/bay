@@ -168,12 +168,12 @@ describe("FakeQueue — assertPushed", () => {
 		await q.push(makeJob({ name: "notify", payload: { userId: 2 } }));
 		expect(() =>
 			q.assertPushed("notify", {
-				payloadMatches: (p) => (p as { userId: number }).userId === 2,
+				payloadMatches: (p) => Reflect.get(Object(p), "userId") === 2,
 			}),
 		).not.toThrow();
 		expect(() =>
 			q.assertPushed("notify", {
-				payloadMatches: (p) => (p as { userId: number }).userId === 99,
+				payloadMatches: (p) => Reflect.get(Object(p), "userId") === 99,
 			}),
 		).toThrow(/no captured job matches/);
 	});
@@ -237,12 +237,12 @@ describe("FakeQueue — assertNotPushed", () => {
 		await q.push(makeJob({ name: "notify", payload: { userId: 1 } }));
 		expect(() =>
 			q.assertNotPushed("notify", {
-				payloadMatches: (p) => (p as { userId: number }).userId === 99,
+				payloadMatches: (p) => Reflect.get(Object(p), "userId") === 99,
 			}),
 		).not.toThrow();
 		expect(() =>
 			q.assertNotPushed("notify", {
-				payloadMatches: (p) => (p as { userId: number }).userId === 1,
+				payloadMatches: (p) => Reflect.get(Object(p), "userId") === 1,
 			}),
 		).toThrow(/at least one captured job matches/);
 	});

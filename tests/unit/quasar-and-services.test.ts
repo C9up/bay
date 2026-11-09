@@ -8,10 +8,14 @@
  * one job, which is to say what to wire.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import BayProvider from "../../src/BayProvider.js";
+import BayProvider, { type BayAppContext } from "../../src/BayProvider.js";
 import { defineConfig } from "../../src/index.js";
 import { QueueManager } from "../../src/QueueManager.js";
-import queue, { getQueue, setQueue } from "../../src/services/main.js";
+import queue, {
+	clearQueue,
+	getQueue,
+	setQueue,
+} from "../../src/services/main.js";
 
 const SPECIFIER = "@c9up/quasar/services/main";
 
@@ -39,7 +43,7 @@ const load = async () => (await import("../../src/quasar.js")).quasarConnection;
 afterEach(() => {
 	vi.doUnmock(SPECIFIER);
 	vi.resetModules();
-	setQueue(undefined as unknown as QueueManager);
+	clearQueue();
 });
 
 describe("bay > the quasar bridge", () => {
@@ -138,18 +142,18 @@ describe("bay > the provider", () => {
 		const bindings = new Map<unknown, () => unknown>();
 		const built = new Map<unknown, unknown>();
 		return {
-			config: { get: <T>(): T | undefined => config as T | undefined },
+			config: { get: () => config },
 			container: {
 				singleton(token: unknown, factory: () => unknown) {
 					bindings.set(token, factory);
 				},
-				async resolve<T>(token: unknown): Promise<T> {
+				async resolve(token: unknown): Promise<unknown> {
 					if (!built.has(token)) {
 						const factory = bindings.get(token);
 						if (!factory) throw new Error(`unbound: ${String(token)}`);
 						built.set(token, await factory());
 					}
-					return built.get(token) as T;
+					return built.get(token);
 				},
 			},
 			bindings,
@@ -257,7 +261,7 @@ describe("bay > the service accessor", () => {
 		// A module loader reads `then` to decide whether the namespace is
 		// thenable, and symbols for interop. Throwing there turns a plain
 		// import into a crash far from any real use.
-		expect((queue as unknown as { then?: unknown }).then).toBeUndefined();
+		expect(Reflect.get(queue, "then")).toBeUndefined();
 		expect(Reflect.get(queue, Symbol.toPrimitive)).toBeUndefined();
 	});
 
@@ -296,22 +300,22 @@ describe("bay > defineConfig", () => {
  * import. Upstream runs preloads between the two phases for exactly this.
  */
 describe("bay > when jobs are discovered", () => {
-	const app = (locations: string[]) => {
+	const app = (locations: string[]): BayAppContext => {
 		const bindings = new Map<unknown, () => unknown>();
 		const built = new Map<unknown, unknown>();
 		return {
-			config: { get: <T>(): T | undefined => ({ locations }) as T },
+			config: { get: () => ({ locations }) },
 			container: {
 				singleton(token: unknown, factory: () => unknown) {
 					bindings.set(token, factory);
 				},
-				async resolve<T>(token: unknown): Promise<T> {
+				async resolve(token: unknown): Promise<unknown> {
 					if (!built.has(token)) {
 						const factory = bindings.get(token);
 						if (!factory) throw new Error(`unbound: ${String(token)}`);
 						built.set(token, await factory());
 					}
-					return built.get(token) as T;
+					return built.get(token);
 				},
 			},
 		};
@@ -320,7 +324,7 @@ describe("bay > when jobs are discovered", () => {
 	it("does not import anything during boot", async () => {
 		// A directory of unloadable files: discovery would throw. Reaching boot
 		// without a throw is the proof that it did not scan.
-		const provider = new BayProvider(app(["./does-not-exist-either"]) as never);
+		const provider = new BayProvider(app(["./does-not-exist-either"]));
 		provider.register();
 
 		await expect(provider.boot()).resolves.toBeUndefined();
@@ -328,7 +332,7 @@ describe("bay > when jobs are discovered", () => {
 	});
 
 	it("refuses to become ready before it has booted", async () => {
-		const provider = new BayProvider(app(["./nowhere"]) as never);
+		const provider = new BayProvider(app(["./nowhere"]));
 		provider.register();
 
 		await expect(provider.ready()).rejects.toThrow(/before boot\(\)/);
