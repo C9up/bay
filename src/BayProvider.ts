@@ -7,7 +7,7 @@ import {
 	discoverJobs,
 	setJobsDir,
 } from "./jobs.js";
-import type { QueueDriver } from "./QueueManager.js";
+import type { Constructor, JobFactory, QueueDriver } from "./QueueManager.js";
 import { QueueManager, type WorkerOptions } from "./QueueManager.js";
 import { clearQueue, getQueue, setQueue } from "./services/main.js";
 
@@ -24,10 +24,20 @@ import { clearQueue, getQueue, setQueue } from "./services/main.js";
  */
 export interface BayContainer {
 	singleton(token: unknown, factory: () => unknown): void;
-	resolve<T = unknown>(token: unknown): Promise<T>;
+	/**
+	 * Answers `unknown`: bay checks what comes back rather than trusting a
+	 * type parameter, so neither a host nor a test has to assert one.
+	 */
+	resolve(token: unknown): Promise<unknown>;
+	/**
+	 * Build a class with its dependencies injected (AdonisJS
+	 * `container.make`). The default job factory when present; without it a
+	 * job class is built with a bare `new`.
+	 */
+	make?(token: unknown): Promise<unknown>;
 }
 export interface BayConfigStore {
-	get<T = unknown>(key: string): T | undefined;
+	get(key: string): unknown;
 }
 export interface BayAppContext {
 	container: BayContainer;
@@ -87,6 +97,40 @@ export interface BayProviderConfig {
 	 * nobody added to it fails as "no handler registered".
 	 */
 	locations?: readonly string[];
+	/**
+	 * How job classes are built — upstream's `jobFactory`. Default: the host
+	 * container's `make`, so a job's constructor dependencies are injected.
+	 */
+	jobFactory?: JobFactory;
+}
+
+/**
+ * `config.get('queue')`, checked to be a config object before it is read as
+ * one. Absent is allowed — the defaults apply.
+ */
+function isProviderConfig(value: unknown): value is BayProviderConfig {
+	if (typeof value !== "object" || value === null) return false;
+	const factory: unknown = Reflect.get(value, "jobFactory");
+	return factory === undefined || typeof factory === "function";
+}
+
+function readConfig(app: BayAppContext): BayProviderConfig | undefined {
+	const value = app.config.get("queue");
+	if (value === undefined) return undefined;
+	if (!isProviderConfig(value)) {
+		throw new Error(
+			"[bay] config.queue must be the object `defineConfig({...})` returns",
+		);
+	}
+	return value;
+}
+
+async function resolveQueue(app: BayAppContext): Promise<QueueManager> {
+	const queue = await app.container.resolve(QueueManager);
+	if (!(queue instanceof QueueManager)) {
+		throw new Error("[bay] the container did not answer a QueueManager");
+	}
+	return queue;
 }
 
 /**
@@ -164,16 +208,25 @@ export default class BayProvider {
 
 	register(): void {
 		this.app.container.singleton(QueueManager, () => {
-			const config = this.app.config.get<BayProviderConfig>("queue");
-			return new QueueManager(buildDriver(config), config?.worker);
+			const config = readConfig(this.app);
+			const container = this.app.container;
+			// Upstream's default: the container builds the job, so its
+			// constructor dependencies arrive. A config factory wins.
+			const jobFactory =
+				config?.jobFactory ??
+				(container.make
+					? (cls: Constructor) => container.make?.(cls)
+					: undefined);
+			return new QueueManager(buildDriver(config), config?.worker, {
+				jobFactory,
+			});
 		});
 		// Namespaced by the package that owns it, the way upstream namespaces
 		// `lucid.db`, `auth.manager` and `drive.manager` by theirs. The bare
 		// token stays bound beside it: it is what every existing
 		// `container.make(...)` asks for, and a token is not worth breaking an
 		// application over.
-		const queue = (): Promise<QueueManager> =>
-			this.app.container.resolve<QueueManager>(QueueManager);
+		const queue = (): Promise<QueueManager> => resolveQueue(this.app);
 		this.app.container.singleton("bay.queue", queue);
 		this.app.container.singleton("queue", queue);
 	}
@@ -184,12 +237,12 @@ export default class BayProvider {
 	async boot(): Promise<void> {
 		// Populate the `@c9up/bay/services/main` singleton so apps can
 		// `import queue from '@c9up/bay/services/main'` from anywhere.
-		this.#queue = await this.app.container.resolve<QueueManager>(QueueManager);
+		this.#queue = await resolveQueue(this.app);
 		setQueue(this.#queue);
 
 		// `make:job` writes where discovery reads, so the two cannot drift. This
 		// half is pure bookkeeping and belongs with the rest of boot.
-		const config = this.app.config.get<BayProviderConfig>("queue");
+		const config = readConfig(this.app);
 		const first = (config?.locations ?? [DEFAULT_JOBS_DIR])[0];
 		if (first !== undefined) setJobsDir(directoryOf(first));
 	}
@@ -216,7 +269,7 @@ export default class BayProvider {
 				"BayProvider.ready() ran before boot() — providers boot before they are ready.",
 			);
 		}
-		const config = this.app.config.get<BayProviderConfig>("queue");
+		const config = readConfig(this.app);
 		const locations = config?.locations ?? [DEFAULT_JOBS_DIR];
 		const resolveLocation = this.app.makePath?.bind(this.app);
 		for (const job of await discoverJobs(locations, resolveLocation)) {

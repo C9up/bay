@@ -95,7 +95,11 @@ export abstract class Job<Payload = unknown> {
 
 /** A job class, as `dispatch` receives it. */
 export interface JobClass<Payload = unknown> {
-	new (): Job<Payload>;
+	/**
+	 * Any constructor: a job takes its dependencies there, and the job factory
+	 * (the host container by default) supplies them.
+	 */
+	new (...args: never[]): Job<Payload>;
 	readonly name: string;
 	readonly options?: JobOptions;
 }

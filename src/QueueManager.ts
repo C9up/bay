@@ -2,6 +2,7 @@ import {
 	checkJobOptions,
 	DEFAULT_QUEUE,
 	isJobClass,
+	Job,
 	type JobClass,
 	type JobOptions,
 	toAttemptCount,
@@ -185,9 +186,43 @@ export interface QueueDriver {
 	readonly renewIntervalMs?: number;
 }
 
+/** A class whose instances the factory is asked to build. */
+export type Constructor<T = unknown> = new (...args: never[]) => T;
+
+/**
+ * Build a job (or handler) class into an instance — upstream's `jobFactory`.
+ *
+ * The host container by default, through the provider, so a job takes its
+ * dependencies in its constructor the way a controller does. What it returns
+ * is checked: a job class must yield an instance of itself, a handler class
+ * something with `handle()`.
+ */
+export type JobFactory = (jobClass: Constructor) => unknown;
+
+/** A registered handler: an instance, or a class built for each job. */
+export type HandlerRegistration = JobHandler | Constructor<JobHandler>;
+
+export interface QueueManagerOptions {
+	/** How job and handler classes are built. Default: `new` with no arguments. */
+	jobFactory?: JobFactory;
+}
+
+function isJobHandler(value: unknown): value is JobHandler {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof Reflect.get(value, "handle") === "function"
+	);
+}
+
+/** What answers to a job's name, before it is built. */
+type Target =
+	| { kind: "handler"; handler: HandlerRegistration }
+	| { kind: "job"; job: JobClass };
+
 export class QueueManager {
 	#driver: QueueDriver;
-	#handlers: Map<string, JobHandler | (new () => JobHandler)> = new Map();
+	#handlers: Map<string, HandlerRegistration> = new Map();
 	#jobs: Map<string, JobClass> = new Map();
 	#running = false;
 	/** The running loop, so `stop()` can wait for it to finish. */
@@ -200,13 +235,20 @@ export class QueueManager {
 	/** Defaults for `work()`, from the config's `worker` block. */
 	readonly #workerDefaults: WorkerOptions;
 
-	constructor(driver: QueueDriver, workerDefaults?: WorkerOptions) {
+	readonly #jobFactory: JobFactory;
+
+	constructor(
+		driver: QueueDriver,
+		workerDefaults?: WorkerOptions,
+		options?: QueueManagerOptions,
+	) {
 		this.#driver = driver;
 		this.#workerDefaults = workerDefaults ?? {};
+		this.#jobFactory = options?.jobFactory ?? ((cls) => new cls());
 	}
 
 	/** Register a job handler under a name. */
-	register(name: string, handler: JobHandler | (new () => JobHandler)): void {
+	register(name: string, handler: HandlerRegistration): void {
 		this.#handlers.set(name, handler);
 	}
 
@@ -312,8 +354,8 @@ export class QueueManager {
 		const job = await this.#driver.pop(queues);
 		if (!job) return false;
 
-		const run = this.#resolveRunner(job.name);
-		if (!run) {
+		const target = this.#lookup(job.name);
+		if (!target) {
 			process.stderr.write(
 				`QueueManager: no handler registered for job '${job.name}'\n`,
 			);
@@ -324,7 +366,6 @@ export class QueueManager {
 			return true;
 		}
 
-		const handler = run;
 		job.attempts++;
 		job.status = "processing";
 		job.processedAt = Date.now();
@@ -338,9 +379,14 @@ export class QueueManager {
 		const stopRenewing = this.#startRenewing(job);
 		const controller = new AbortController();
 		let execution: Promise<void> | undefined;
+		let runner: JobRunner | undefined;
 		let handled = false;
 		try {
-			execution = Promise.resolve(handler.run(job.payload, controller.signal));
+			// Built inside the attempt: a factory that throws — a dependency the
+			// container cannot resolve — is this attempt failing, not the
+			// worker.
+			runner = await this.#build(target);
+			execution = Promise.resolve(runner.run(job.payload, controller.signal));
 			await withTimeout(execution, job.timeout, job.name, controller);
 			handled = true;
 		} catch (err) {
@@ -357,7 +403,7 @@ export class QueueManager {
 				// reported and swallowed: the job has already failed, and
 				// failing to say so must not be read as a second failure.
 				try {
-					await handler.onFailed?.(error);
+					await runner?.onFailed?.(error);
 				} catch (hookErr) {
 					process.stderr.write(
 						`QueueManager: failed() hook of '${job.name}' threw: ${
@@ -395,23 +441,40 @@ export class QueueManager {
 	}
 
 	/**
-	 * The runner for `name`: a registered handler, or a job class.
+	 * What answers to `name`: a registered handler, or a job class.
 	 *
 	 * A handler registered under the name wins — an application that registers
 	 * one deliberately is overriding whatever else answers to it.
 	 */
-	#resolveRunner(name: string): JobRunner | undefined {
-		const handlerOrClass = this.#handlers.get(name);
-		if (handlerOrClass !== undefined) {
+	#lookup(name: string): Target | undefined {
+		const handler = this.#handlers.get(name);
+		if (handler !== undefined) return { kind: "handler", handler };
+		const job = this.#jobs.get(name);
+		return job === undefined ? undefined : { kind: "job", job };
+	}
+
+	/** Build what answers to the job into the thing that runs one attempt. */
+	async #build(target: Target): Promise<JobRunner> {
+		if (target.kind === "handler") {
+			const registered = target.handler;
 			const handler =
-				typeof handlerOrClass === "function"
-					? new handlerOrClass()
-					: handlerOrClass;
+				typeof registered === "function"
+					? await this.#jobFactory(registered)
+					: registered;
+			if (!isJobHandler(handler)) {
+				throw new Error(
+					"The job factory built something without a handle() method for a registered handler class",
+				);
+			}
 			return { run: (payload, signal) => handler.handle(payload, signal) };
 		}
-		const JobConstructor = this.#jobs.get(name);
-		if (JobConstructor === undefined) return undefined;
-		const instance = new JobConstructor();
+		const JobConstructor = target.job;
+		const instance = await this.#jobFactory(JobConstructor);
+		if (!(instance instanceof Job)) {
+			throw new Error(
+				`The job factory built ${JobConstructor.name} into something that is not an instance of it`,
+			);
+		}
 		return {
 			run: (payload, signal) => {
 				// `payload` and `signal` are declared readonly on the class so a

@@ -80,6 +80,22 @@ The class carries its own name, its options and the type of the payload it
 reads, so a field the handler reads cannot be one the dispatcher never sent. The
 call site overrides any of them: `dispatch(SendEmail, payload, { queue: 'critical' })`.
 
+A job is built by the container, so it takes its dependencies in its
+constructor the way a controller does:
+
+```ts
+@inject()
+export default class SendInvoice extends Job<{ id: number }> {
+  constructor(private mailer: Mailer, private invoices: InvoiceRepository) {
+    super()
+  }
+}
+```
+
+`jobFactory` in `config/queue.ts` replaces the container when a job needs
+building some other way; a factory that throws is a failed attempt, retried like
+any other.
+
 Registering by name still works, and is what a job whose name is computed at
 runtime needs:
 

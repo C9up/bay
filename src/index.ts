@@ -39,10 +39,14 @@ export {
 	type JobOptions,
 } from "./Job.js";
 export type {
+	Constructor,
 	DispatchOptions,
+	HandlerRegistration,
+	JobFactory,
 	JobHandler,
 	JobRecord,
 	QueueDriver,
+	QueueManagerOptions,
 	WorkerOptions,
 } from "./QueueManager.js";
 export { QueueManager, queueOf } from "./QueueManager.js";
