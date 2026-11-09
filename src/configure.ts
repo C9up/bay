@@ -24,6 +24,14 @@ interface Codemods {
 		state?: Record<string, string | number | boolean>,
 		options?: { force?: boolean },
 	): Promise<{ path: string; contents: string }>;
+	/**
+	 * Add rules to `start/env.ts`. Optional: a host that predates it is still
+	 * configured, without the validation.
+	 */
+	defineEnvValidations?(definition: {
+		leadingComment?: string;
+		variables: Record<string, string>;
+	}): Promise<unknown>;
 }
 
 export async function configure(codemods: Codemods): Promise<void> {
@@ -33,6 +41,17 @@ export async function configure(codemods: Codemods): Promise<void> {
 	await codemods.addEnvVars({
 		QUEUE_DRIVER: "memory",
 	});
+	// The adapters the generated config declares, and nothing else, so a typo
+	// fails at boot rather than as "the config names an adapter that is not
+	// declared" on the first dispatch.
+	if (typeof codemods.defineEnvValidations === "function") {
+		await codemods.defineEnvValidations({
+			leadingComment: "Variables for configuring @c9up/bay",
+			variables: {
+				QUEUE_DRIVER: "Env.schema.enum(['memory', 'redis'] as const)",
+			},
+		});
+	}
 
 	await codemods.addProvider("@c9up/bay/provider");
 	// `queue:work` and `make:job` are the package's, not the binary's: a

@@ -102,3 +102,38 @@ describe("bay > configure", () => {
 		expect(files[0]?.content).toContain("from '@c9up/bay'");
 	});
 });
+
+describe("bay > configure validates what it declares", () => {
+	it("adds a validation for QUEUE_DRIVER when the host can", async () => {
+		const { codemods } = fakeCodemods();
+		const validations: unknown[] = [];
+
+		await configure({
+			...codemods,
+			async defineEnvValidations(definition: {
+				leadingComment?: string;
+				variables: Record<string, string>;
+			}) {
+				validations.push(definition);
+				return [];
+			},
+		});
+
+		// The adapters the generated config declares, and nothing else: a
+		// typo in QUEUE_DRIVER fails at boot instead of selecting nothing.
+		expect(validations).toEqual([
+			{
+				leadingComment: "Variables for configuring @c9up/bay",
+				variables: {
+					QUEUE_DRIVER: "Env.schema.enum(['memory', 'redis'] as const)",
+				},
+			},
+		]);
+	});
+
+	it("still configures a host that predates env validations", async () => {
+		const { providers, codemods } = fakeCodemods();
+		await configure(codemods);
+		expect(providers).toEqual(["@c9up/bay/provider"]);
+	});
+});
