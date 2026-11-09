@@ -105,6 +105,31 @@ queue.register('send-email', new SendEmailHandler())
 await queue.dispatch('send-email', { to: 'user@example.com' })
 ```
 
+## Priorities, unique jobs, recurring jobs
+
+```ts
+await queue.dispatch(SendAlert, payload, { priority: 1 })   // 1 runs first, 10 last, 5 by default
+await queue.dispatch(SendInvoice, { orderId: 42 }, { dedup: { id: 'order-42' } })
+await queue.dispatch(SyncDraft, draft, { dedup: { id: 'draft-7', ttl: '2s', extend: true } })
+```
+
+Within one queue a lower `priority` runs first, and jobs of one priority keep
+the order they were queued in. A job class can declare it in `static options`.
+
+`dedup` queues the job only if no job of the same name holds that id, and
+`dispatch` answers the id of the one that does. Without `ttl` the id is held
+until the job completes or finally fails — a retried job still holds it; with
+`ttl` it is held that long at most, and `extend` restarts the window on each
+duplicate. Upstream's `replace` (swap the payload of the waiting job) is not
+offered: a waiting job is stored as one serialised entry, and rewriting it in
+place cannot be made atomic without reading it back — dispatch a fresh job
+after the first completes instead.
+
+Recurring jobs are not bay's: ream's scheduler (`@Schedule('0 3 * * *')` on a
+service method) runs on the Rust ticker with a distributed lock, and the method
+dispatches the job. A second scheduler inside the queue would be a second clock
+to keep in step.
+
 ## Workers
 
 ```bash

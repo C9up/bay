@@ -41,6 +41,7 @@ export type {
 } from "./drivers/RedisDriver.js";
 export { RedisDriver } from "./drivers/RedisDriver.js";
 export {
+	DEFAULT_PRIORITY,
 	DEFAULT_QUEUE,
 	type Duration,
 	isJobClass,

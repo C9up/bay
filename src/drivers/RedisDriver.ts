@@ -20,7 +20,11 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { DEFAULT_QUEUE } from "../Job.js";
+import { DEFAULT_PRIORITY, DEFAULT_QUEUE } from "../Job.js";
+
+/** Priorities run from 1 to this, upstream's scale. */
+const PRIORITY_LEVELS = 10;
+
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
 import { parseJob, type Unreadable } from "../record.js";
 
@@ -42,8 +46,6 @@ export interface RedisClient {
 	): Promise<unknown>;
 	rpush(key: string, ...values: string[]): Promise<number>;
 	zadd(key: string, score: number, member: string): Promise<number | string>;
-	llen(key: string): Promise<number>;
-	zcard(key: string): Promise<number>;
 	lrange(key: string, start: number, stop: number): Promise<string[]>;
 }
 
@@ -103,26 +105,89 @@ local function job_id(raw)
   return nil
 end
 
-for i = 2, #KEYS, 2 do
-  local pending = KEYS[i]
-  local delayed = KEYS[i + 1]
-  local due = redis.call('ZRANGEBYSCORE', delayed, '-inf', now, 'LIMIT', 0, 100)
-  for _, raw in ipairs(due) do
-    redis.call('ZREM', delayed, raw)
-    redis.call('RPUSH', pending, raw)
-  end
-  local raw = redis.call('LPOP', pending)
-  if raw then
-    redis.call('RPUSH', processing, raw)
-    local id = job_id(raw)
-    if id then
-      redis.call('SET', lease_prefix .. id, token, 'PX', ttl)
-      return { raw, id }
+-- Each queue brings one pending list and one delayed set per priority,
+-- most urgent first.
+local levels = tonumber(ARGV[5])
+for q = 2, #KEYS, levels * 2 do
+  for l = 0, levels - 1 do
+    local pending = KEYS[q + l * 2]
+    local delayed = KEYS[q + l * 2 + 1]
+    local due = redis.call('ZRANGEBYSCORE', delayed, '-inf', now, 'LIMIT', 0, 100)
+    for _, raw in ipairs(due) do
+      redis.call('ZREM', delayed, raw)
+      redis.call('RPUSH', pending, raw)
     end
-    return { raw }
+  end
+  for l = 0, levels - 1 do
+    local raw = redis.call('LPOP', KEYS[q + l * 2])
+    if raw then
+      redis.call('RPUSH', processing, raw)
+      local id = job_id(raw)
+      if id then
+        redis.call('SET', lease_prefix .. id, token, 'PX', ttl)
+        return { raw, id }
+      end
+      return { raw }
+    end
   end
 end
 return false
+`);
+
+/**
+ * A dedup id is stored as `<ttl>:<job id>` — the ttl so `extend` restarts the
+ * window the first dispatch opened, the id so only that job releases it.
+ */
+const RELEASE_DEDUP = `
+local function release_dedup(key, job_id)
+  if key == '' then return end
+  local held = redis.call('GET', key)
+  if held and string.match(held, '^%d+:(.*)$') == job_id then
+    redis.call('DEL', key)
+  end
+end
+`;
+
+/**
+ * Queue a job unless another holds its dedup id — one step, so two
+ * dispatches racing on one id queue one job.
+ *
+ * KEYS: dedup id, destination. ARGV: job id, entry, mode (`list` | `zset`),
+ * score, ttl (0 for none), extend (`1` | `0`). Answers the holder's id, or
+ * false when this job was queued.
+ */
+const PUSH_DEDUP = script(`
+local held = redis.call('GET', KEYS[1])
+if held then
+  local ttl, holder = string.match(held, '^(%d+):(.*)$')
+  if holder then
+    if ARGV[6] == '1' and tonumber(ttl) > 0 then
+      redis.call('PEXPIRE', KEYS[1], ttl)
+    end
+    return holder
+  end
+end
+local ttl = tonumber(ARGV[5])
+if ttl > 0 then
+  redis.call('SET', KEYS[1], ARGV[5] .. ':' .. ARGV[1], 'PX', ttl)
+else
+  redis.call('SET', KEYS[1], '0:' .. ARGV[1])
+end
+if ARGV[3] == 'zset' then
+  redis.call('ZADD', KEYS[2], ARGV[4], ARGV[2])
+else
+  redis.call('RPUSH', KEYS[2], ARGV[2])
+end
+return false
+`);
+
+/** Jobs waiting: KEYS alternate a pending list and its delayed set. */
+const SIZE = script(`
+local total = 0
+for i = 1, #KEYS, 2 do
+  total = total + redis.call('LLEN', KEYS[i]) + redis.call('ZCARD', KEYS[i + 1])
+end
+return total
 `);
 
 /** Extend a lease, only for the worker that holds it. */
@@ -138,10 +203,13 @@ return 0
  * Settle a job the caller holds: drop its entry and lease, and put it where it
  * goes next. A caller whose lease is gone changes nothing.
  *
- * KEYS: lease, processing, destination. ARGV: token, stored entry, mode
- * (`complete` | `list` | `zset` | `failed`), new entry, score or failed cap.
+ * KEYS: lease, processing, destination, dedup id (empty for none). ARGV:
+ * token, stored entry, mode (`complete` | `list` | `zset` | `failed`), new
+ * entry, score or failed cap, job id. A job that is done or finally failed lets
+ * its dedup id go; a retried one still holds it.
  */
 const SETTLE = script(`
+${RELEASE_DEDUP}
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
   return 0
 end
@@ -159,6 +227,9 @@ elseif mode == 'failed' then
     redis.call('LTRIM', KEYS[3], -keep, -1)
   end
 end
+if mode == 'complete' or mode == 'failed' then
+  release_dedup(KEYS[4], ARGV[6])
+end
 return 1
 `);
 
@@ -166,10 +237,12 @@ return 1
  * Move one orphaned entry out of `processing`, unless it is leased after all.
  * The LREM is the claim: of two passes over the same entry, one moves it.
  *
- * KEYS: processing, destination, lease (empty when the record has no id).
- * ARGV: stored entry, mode (`list` | `failed`), new entry, failed cap.
+ * KEYS: processing, destination, lease (empty when the record has no id),
+ * dedup id (empty for none). ARGV: stored entry, mode (`list` | `failed`), new
+ * entry, failed cap, job id.
  */
 const RECOVER = script(`
+${RELEASE_DEDUP}
 if KEYS[3] ~= '' and redis.call('EXISTS', KEYS[3]) == 1 then
   return 0
 end
@@ -182,6 +255,7 @@ if ARGV[2] == 'failed' then
   if keep > 0 then
     redis.call('LTRIM', KEYS[2], -keep, -1)
   end
+  release_dedup(KEYS[4], ARGV[5])
 end
 return 1
 `);
@@ -338,15 +412,43 @@ export class RedisDriver implements QueueDriver {
 	 * The default queue keeps the key it always had: renaming it would orphan
 	 * every job already sitting in `queue:pending` at the moment of an upgrade.
 	 */
-	#pendingKey(queue: string = DEFAULT_QUEUE): string {
-		return queue === DEFAULT_QUEUE
-			? `${this.#prefix}pending`
-			: `${this.#prefix}q:${queue}:pending`;
+	#pendingKey(queue: string, priority: number): string {
+		const base =
+			queue === DEFAULT_QUEUE
+				? `${this.#prefix}pending`
+				: `${this.#prefix}q:${queue}:pending`;
+		// The default priority keeps the bare key, for the same reason.
+		return priority === DEFAULT_PRIORITY ? base : `${base}:p${priority}`;
 	}
-	#delayedKey(queue: string = DEFAULT_QUEUE): string {
-		return queue === DEFAULT_QUEUE
-			? `${this.#prefix}delayed`
-			: `${this.#prefix}q:${queue}:delayed`;
+	#delayedKey(queue: string, priority: number): string {
+		const base =
+			queue === DEFAULT_QUEUE
+				? `${this.#prefix}delayed`
+				: `${this.#prefix}q:${queue}:delayed`;
+		return priority === DEFAULT_PRIORITY ? base : `${base}:p${priority}`;
+	}
+	/** Where `job` waits: its queue's list at its priority. */
+	#pendingOf(job: JobRecord): string {
+		return this.#pendingKey(queueOf(job), job.priority ?? DEFAULT_PRIORITY);
+	}
+	#delayedOf(job: JobRecord): string {
+		return this.#delayedKey(queueOf(job), job.priority ?? DEFAULT_PRIORITY);
+	}
+	/** Every pending list and delayed set of `queue`, most urgent first. */
+	#levels(queue: string): string[] {
+		const keys: string[] = [];
+		for (let priority = 1; priority <= PRIORITY_LEVELS; priority++) {
+			keys.push(
+				this.#pendingKey(queue, priority),
+				this.#delayedKey(queue, priority),
+			);
+		}
+		return keys;
+	}
+	#dedupKey(job: JobRecord): string {
+		return job.dedup === undefined
+			? ""
+			: `${this.#prefix}dedup:${job.dedup.id}`;
 	}
 	#processingKey(): string {
 		return `${this.#prefix}processing`;
@@ -378,15 +480,35 @@ export class RedisDriver implements QueueDriver {
 		return client.eval(lua, keys.length, ...keys, ...args);
 	}
 
-	async push(job: JobRecord): Promise<void> {
+	async push(job: JobRecord): Promise<string | undefined> {
 		const client = await this.#client();
 		const raw = JSON.stringify(job);
-		const queue = queueOf(job);
-		if (job.runAt !== undefined && job.runAt > Date.now()) {
-			await client.zadd(this.#delayedKey(queue), job.runAt, raw);
-			return;
+		const delayed = job.runAt !== undefined && job.runAt > Date.now();
+		if (job.dedup !== undefined) {
+			const holder = await this.#run(
+				client,
+				PUSH_DEDUP,
+				[
+					this.#dedupKey(job),
+					delayed ? this.#delayedOf(job) : this.#pendingOf(job),
+				],
+				[
+					job.id,
+					raw,
+					delayed ? "zset" : "list",
+					job.runAt ?? 0,
+					job.dedup.ttl ?? 0,
+					job.dedup.extend ? "1" : "0",
+				],
+			);
+			return typeof holder === "string" ? holder : undefined;
 		}
-		await client.rpush(this.#pendingKey(queue), raw);
+		if (delayed) {
+			await client.zadd(this.#delayedOf(job), job.runAt ?? 0, raw);
+		} else {
+			await client.rpush(this.#pendingOf(job), raw);
+		}
+		return undefined;
 	}
 
 	async pop(
@@ -395,9 +517,7 @@ export class RedisDriver implements QueueDriver {
 		if (queues.length === 0) return null;
 		const client = await this.#client();
 		const keys = [this.#processingKey()];
-		for (const queue of queues) {
-			keys.push(this.#pendingKey(queue), this.#delayedKey(queue));
-		}
+		for (const queue of queues) keys.push(...this.#levels(queue));
 		// A record that cannot run is filed and the next one taken, so a run of
 		// bad entries does not cost a full idle delay each. Bounded, so a queue
 		// of nothing else still returns.
@@ -409,6 +529,7 @@ export class RedisDriver implements QueueDriver {
 					token,
 					this.#visibilityTimeout,
 					`${this.#prefix}lease:`,
+					PRIORITY_LEVELS,
 				]),
 			);
 			if (reply === null) return null;
@@ -456,16 +577,16 @@ export class RedisDriver implements QueueDriver {
 			await this.#run(
 				client,
 				SETTLE,
-				[this.#leaseKey(held.id), this.#processingKey(), this.#failedKey()],
-				[held.token, raw, "failed", record, this.#maxFailedJobs],
+				[this.#leaseKey(held.id), this.#processingKey(), this.#failedKey(), ""],
+				[held.token, raw, "failed", record, this.#maxFailedJobs, ""],
 			);
 			return;
 		}
 		await this.#run(
 			client,
 			RECOVER,
-			[this.#processingKey(), this.#failedKey(), ""],
-			[raw, "failed", record, this.#maxFailedJobs],
+			[this.#processingKey(), this.#failedKey(), "", ""],
+			[raw, "failed", record, this.#maxFailedJobs, ""],
 		);
 	}
 
@@ -521,12 +642,11 @@ export class RedisDriver implements QueueDriver {
 
 	async retry(job: JobRecord): Promise<void> {
 		job.status = "pending";
-		const queue = queueOf(job);
 		if (job.runAt !== undefined && job.runAt > Date.now()) {
 			await this.#settle(
 				job,
 				"zset",
-				this.#delayedKey(queue),
+				this.#delayedOf(job),
 				JSON.stringify(job),
 				job.runAt,
 			);
@@ -535,7 +655,7 @@ export class RedisDriver implements QueueDriver {
 		await this.#settle(
 			job,
 			"list",
-			this.#pendingKey(queue),
+			this.#pendingOf(job),
 			JSON.stringify(job),
 			0,
 		);
@@ -559,8 +679,13 @@ export class RedisDriver implements QueueDriver {
 		const settled = await this.#run(
 			client,
 			SETTLE,
-			[this.#leaseKey(claim.id), this.#processingKey(), destination],
-			[claim.token, claim.raw, mode, entry, extra],
+			[
+				this.#leaseKey(claim.id),
+				this.#processingKey(),
+				destination,
+				this.#dedupKey(job),
+			],
+			[claim.token, claim.raw, mode, entry, extra, job.id],
 		);
 		this.#claims.delete(job);
 		if (settled !== 1) {
@@ -586,12 +711,14 @@ export class RedisDriver implements QueueDriver {
 						this.#processingKey(),
 						this.#failedKey(),
 						parsed.id === undefined ? "" : this.#leaseKey(parsed.id),
+						"",
 					],
 					[
 						raw,
 						"failed",
 						JSON.stringify(this.#deadLetter(raw, parsed)),
 						this.#maxFailedJobs,
+						"",
 					],
 				);
 				continue;
@@ -618,14 +745,16 @@ export class RedisDriver implements QueueDriver {
 					this.#processingKey(),
 					// Back to the queue it came from: a recovered job whose queue
 					// nobody serves would never run again.
-					exhausted ? this.#failedKey() : this.#pendingKey(queueOf(job)),
+					exhausted ? this.#failedKey() : this.#pendingOf(job),
 					this.#leaseKey(job.id),
+					this.#dedupKey(job),
 				],
 				[
 					raw,
 					exhausted ? "failed" : "list",
 					JSON.stringify(job),
 					this.#maxFailedJobs,
+					job.id,
 				],
 			);
 			if (moved === 1 && !exhausted) recovered++;
@@ -657,8 +786,10 @@ export class RedisDriver implements QueueDriver {
 	 */
 	async sizeOf(queue: string): Promise<number> {
 		const client = await this.#client();
-		const waiting = await client.llen(this.#pendingKey(queue));
-		const delayed = await client.zcard(this.#delayedKey(queue));
-		return waiting + delayed;
+		const total = await this.#run(client, SIZE, this.#levels(queue), []);
+		if (typeof total !== "number") {
+			throw new Error("[bay] unexpected reply from the size script");
+		}
+		return total;
 	}
 }

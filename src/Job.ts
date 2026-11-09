@@ -51,6 +51,11 @@ export interface JobOptions {
 	/** Named queue this job waits in. Default `"default"`. */
 	queue?: string;
 	/**
+	 * 1 to 10, lower runs first — upstream's scale. Default `5`. Within one
+	 * priority jobs keep the order they were queued in.
+	 */
+	priority?: number;
+	/**
 	 * How many times the handler may run before the job is filed as failed.
 	 * Default `3`. Counts runs, not retries: `1` means one attempt and no
 	 * second chance.
@@ -152,6 +157,19 @@ export function toAttemptCount(value: number, label: string): number {
 	return value;
 }
 
+/** The priority a job runs at when nothing names one. */
+export const DEFAULT_PRIORITY = 5;
+
+/** A priority on upstream's scale: a whole number from 1 (first) to 10. */
+export function toPriority(value: number): number {
+	if (!Number.isInteger(value) || value < 1 || value > 10) {
+		throw new Error(
+			`priority must be a whole number from 1 to 10, got ${value}`,
+		);
+	}
+	return value;
+}
+
 /** The longest delay `setTimeout` holds; past it Node fires after 1 ms. */
 export const MAX_TIMEOUT = 2_147_483_647;
 
@@ -187,6 +205,7 @@ export function checkJobOptions(job: JobClass): void {
 		) {
 			throw new Error("options.name must be a non-empty string");
 		}
+		if (options.priority !== undefined) toPriority(options.priority);
 		const maxRetries = options.maxRetries ?? options.retry?.maxRetries;
 		if (maxRetries !== undefined) toAttemptCount(maxRetries, "maxRetries");
 		toTimeout(options.timeout);

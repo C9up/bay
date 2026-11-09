@@ -36,8 +36,6 @@ function inertClient(): RedisClient {
 		eval: never,
 		rpush: never,
 		zadd: never,
-		llen: never,
-		zcard: never,
 		lrange: never,
 	};
 }

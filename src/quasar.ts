@@ -13,7 +13,7 @@ import { quasarConnection as loadQuasarConnection } from "./vendor/quasarConnect
 
 // The commands this driver actually issues — every non-optional member of
 // `RedisClient`. `evalsha` is optional: without it scripts are sent in full.
-const REQUIRED = ["eval", "rpush", "zadd", "llen", "zcard", "lrange"] as const;
+const REQUIRED = ["eval", "rpush", "zadd", "lrange"] as const;
 
 /**
  * A resolver — quasar is loaded on first use, not at config time.

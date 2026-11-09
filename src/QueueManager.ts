@@ -11,6 +11,7 @@ import {
 	MAX_TIMEOUT,
 	toAttemptCount,
 	toMilliseconds,
+	toPriority,
 	toTimeout,
 } from "./Job.js";
 
@@ -58,6 +59,13 @@ export interface JobRecord {
 	queue?: string;
 	/** Epoch ms before which no worker may take the job (`delay`). */
 	runAt?: number;
+	/** 1 to 10, lower runs first. Absent reads as 5. */
+	priority?: number;
+	/**
+	 * The dedup id, prefixed with the job name so two job types never share
+	 * one, and how long it is held.
+	 */
+	dedup?: { id: string; ttl?: number; extend?: boolean };
 	/** Milliseconds the handler gets before the attempt counts as failed. */
 	timeout?: number;
 	/**
@@ -146,6 +154,33 @@ function toPollDelay(value: Duration, label: string): number {
 	return ms;
 }
 
+/** Check a dedup request and key it by job name. */
+function toDedup(
+	name: string,
+	dedup: { id: string; ttl?: Duration; extend?: boolean },
+): { id: string; ttl?: number; extend?: boolean } {
+	if (typeof dedup.id !== "string" || dedup.id.length === 0) {
+		throw new Error("dedup.id must be a non-empty string");
+	}
+	const ttl =
+		dedup.ttl === undefined
+			? undefined
+			: toMilliseconds(dedup.ttl, "dedup.ttl");
+	if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 1)) {
+		throw new Error(
+			`dedup.ttl must be a whole number of milliseconds from 1 up, got ${String(dedup.ttl)}`,
+		);
+	}
+	if (dedup.extend && ttl === undefined) {
+		throw new Error("dedup.extend needs a ttl: there is no window to restart");
+	}
+	return {
+		id: `${name}::${dedup.id}`,
+		ttl,
+		extend: dedup.extend === true ? true : undefined,
+	};
+}
+
 /** Upstream's wait before a job nothing answers to is looked at again. */
 const UNKNOWN_JOB_RETRY_DELAY = 30_000;
 
@@ -221,12 +256,26 @@ export interface WorkerOptions {
  * site passes. `maxRetries` is the class's name for the same number.
  */
 export interface DispatchOptions extends Omit<JobOptions, "name"> {
+	/**
+	 * Queue the job only if no job of the same name holds this `id` —
+	 * upstream's dedup. Without `ttl` the id is held until the job completes
+	 * or finally fails; with it, for `ttl` at most, and `extend` restarts that
+	 * window on each duplicate. `dispatch` answers the id of the job that
+	 * holds it.
+	 */
+	dedup?: { id: string; ttl?: Duration; extend?: boolean };
 	/** The older spelling of `maxRetries`. Wins when both are given. */
 	maxAttempts?: number;
 }
 
 export interface QueueDriver {
-	push(job: JobRecord): Promise<void>;
+	/**
+	 * Store a job. A driver that honours `job.dedup` answers the id (a string)
+	 * of the job already holding it, when one does, and stores nothing; any
+	 * other answer means the job was stored. `unknown` so a driver written
+	 * before dedup, answering nothing, still fits.
+	 */
+	push(job: JobRecord): Promise<unknown>;
 	/**
 	 * Take the next job from one of `queues`, or from the default queue when
 	 * the caller names none.
@@ -448,8 +497,14 @@ export class QueueManager {
 		if (timeoutMs !== undefined) record.timeout = timeoutMs;
 		const backoff = options.retry?.backoff ?? declared.retry?.backoff;
 		if (backoff !== undefined) record.backoff = backoff().getConfig();
-		await this.#driver.push(record);
-		return id;
+		const priority = options.priority ?? declared.priority;
+		if (priority !== undefined) record.priority = toPriority(priority);
+		if (options.dedup !== undefined) {
+			record.dedup = toDedup(name, options.dedup);
+		}
+		// A driver honouring dedup answers the id that holds the place.
+		const holder = await this.#driver.push(record);
+		return typeof holder === "string" ? holder : id;
 	}
 
 	/**

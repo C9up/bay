@@ -100,8 +100,6 @@ describe("bay > store selection", () => {
 					rpush: async () => 1,
 					zadd: async () => 1,
 					lrange: async () => [],
-					llen: async () => 0,
-					zcard: async () => 0,
 				},
 			})(),
 		).toBeInstanceOf(RedisDriver);

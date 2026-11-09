@@ -219,8 +219,6 @@ describe("bay > recovery bounds are validated", () => {
 			eval: async () => null,
 			rpush: async () => 0,
 			zadd: async () => 0,
-			llen: async () => 0,
-			zcard: async () => 0,
 			lrange: async () => [],
 		};
 		for (const bad of [-1, 1.5, Number.NaN]) {

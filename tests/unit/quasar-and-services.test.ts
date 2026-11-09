@@ -20,7 +20,7 @@ import queue, {
 const SPECIFIER = "@c9up/quasar/services/main";
 
 /** Every command the redis driver actually issues. */
-const commands = ["eval", "rpush", "zadd", "llen", "zcard", "lrange"];
+const commands = ["eval", "rpush", "zadd", "lrange"];
 
 const client = (omit?: string) =>
 	Object.fromEntries(

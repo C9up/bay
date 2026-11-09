@@ -2,9 +2,13 @@
  * Memory queue driver — in-process queue for development and tests.
  */
 
-import { DEFAULT_QUEUE } from "../Job.js";
+import { DEFAULT_PRIORITY, DEFAULT_QUEUE } from "../Job.js";
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
 import { snapshot } from "../record.js";
+
+function priorityOf(job: JobRecord | undefined): number {
+	return job?.priority ?? DEFAULT_PRIORITY;
+}
 
 export class MemoryDriver implements QueueDriver {
 	/** One list per named queue, created on first use. */
@@ -19,6 +23,8 @@ export class MemoryDriver implements QueueDriver {
 	#delayed: JobRecord[] = [];
 	#failedJobs: JobRecord[] = [];
 	#maxFailedJobs: number;
+	/** Dedup id → the job holding it, and until when (epoch ms) if it expires. */
+	#dedup: Map<string, { jobId: string; expiresAt?: number }> = new Map();
 
 	constructor(options?: { maxFailedJobs?: number }) {
 		this.#maxFailedJobs = options?.maxFailedJobs ?? 1000;
@@ -50,7 +56,27 @@ export class MemoryDriver implements QueueDriver {
 	 * or a BigInt survived here and nowhere else — tests passed on behaviour
 	 * production does not have.
 	 */
-	async push(job: JobRecord): Promise<void> {
+	async push(job: JobRecord): Promise<string | undefined> {
+		const dedup = job.dedup;
+		if (dedup !== undefined) {
+			const now = Date.now();
+			const held = this.#dedup.get(dedup.id);
+			if (held && (held.expiresAt === undefined || held.expiresAt > now)) {
+				if (dedup.extend && dedup.ttl !== undefined) {
+					held.expiresAt = now + dedup.ttl;
+				}
+				return held.jobId;
+			}
+			this.#dedup.set(dedup.id, {
+				jobId: job.id,
+				expiresAt: dedup.ttl === undefined ? undefined : now + dedup.ttl,
+			});
+		}
+		this.#store(job);
+		return undefined;
+	}
+
+	#store(job: JobRecord): void {
 		const stored = snapshot(job);
 		if (stored.runAt !== undefined && stored.runAt > Date.now()) {
 			this.#delayed.push(stored);
@@ -60,14 +86,30 @@ export class MemoryDriver implements QueueDriver {
 		this.#queue(queueOf(stored)).push(stored);
 	}
 
+	/** Let the next job with this dedup id be queued. */
+	#release(job: JobRecord): void {
+		const id = job.dedup?.id;
+		if (id !== undefined && this.#dedup.get(id)?.jobId === job.id) {
+			this.#dedup.delete(id);
+		}
+	}
+
 	async pop(
 		queues: readonly string[] = [DEFAULT_QUEUE],
 	): Promise<JobRecord | null> {
 		this.#promoteDue();
 		// In the order given: naming `['critical', 'default']` is how a worker
 		// says which queue it would rather drain first.
+		// Within a queue the lowest priority number first, and the oldest of
+		// those: the first one found, since jobs are appended in order.
 		for (const name of queues) {
-			const next = this.#pending.get(name)?.shift();
+			const jobs = this.#pending.get(name);
+			if (jobs === undefined || jobs.length === 0) continue;
+			let best = 0;
+			for (let index = 1; index < jobs.length; index++) {
+				if (priorityOf(jobs[index]) < priorityOf(jobs[best])) best = index;
+			}
+			const [next] = jobs.splice(best, 1);
 			if (next !== undefined) return next;
 		}
 		return null;
@@ -76,20 +118,24 @@ export class MemoryDriver implements QueueDriver {
 	async fail(job: JobRecord, error: string): Promise<void> {
 		job.error = error;
 		job.status = "failed";
+		this.#release(job);
 		this.#failedJobs.push(snapshot(job));
 		if (this.#failedJobs.length > this.#maxFailedJobs) {
 			this.#failedJobs.splice(0, this.#failedJobs.length - this.#maxFailedJobs);
 		}
 	}
 
-	async complete(_job: JobRecord): Promise<void> {
-		// Nothing to do for memory driver
+	async complete(job: JobRecord): Promise<void> {
+		this.#release(job);
 	}
 
-	/** Back in its queue, or with the delayed jobs when it carries a backoff. */
+	/**
+	 * Back in its queue, or with the delayed jobs when it carries a backoff.
+	 * Its dedup id stays held: the job still exists.
+	 */
 	async retry(job: JobRecord): Promise<void> {
 		job.status = "pending";
-		await this.push(job);
+		this.#store(job);
 	}
 
 	async failed(): Promise<JobRecord[]> {

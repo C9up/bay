@@ -11,11 +11,10 @@ import {
 } from "../../src/drivers/RedisDriver.js";
 
 const fakeClient = (): RedisClient => ({
-	eval: async () => null,
+	// The size script's answer for an empty queue.
+	eval: async () => 0,
 	rpush: async () => 1,
 	zadd: async () => 1,
-	llen: async () => 0,
-	zcard: async () => 0,
 	lrange: async () => [],
 });
 

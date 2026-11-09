@@ -15,8 +15,6 @@ const inert = (): RedisClient => ({
 	eval: async () => null,
 	rpush: async () => 0,
 	zadd: async () => 0,
-	llen: async () => 0,
-	zcard: async () => 0,
 	lrange: async () => [],
 });
 
