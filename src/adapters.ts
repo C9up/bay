@@ -27,7 +27,10 @@
  */
 
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
-import type { RedisClientSource } from "./drivers/RedisDriver.js";
+import type {
+	RedisClientSource,
+	RedisDriverOptions,
+} from "./drivers/RedisDriver.js";
 import { RedisDriver } from "./drivers/RedisDriver.js";
 import type { QueueDriver } from "./QueueManager.js";
 import { quasarConnection } from "./quasar.js";
@@ -50,21 +53,20 @@ export const drivers = {
 	 * Redis. `connection` takes an ioredis-shaped client, a function answering
 	 * one, or the NAME of a `@c9up/quasar` connection — the last resolved at
 	 * first use, without bay importing quasar, which stays an optional peer.
+	 *
+	 * Every other option is the driver's own, passed through whole: this is
+	 * the only way a config file builds the driver, so an option dropped here
+	 * is one no application can set.
 	 */
-	redis(options: {
-		connection: RedisClientSource | string;
-		prefix?: string;
-		visibilityTimeoutMs?: number;
-	}): AdapterFactory {
+	redis(
+		options: { connection: RedisClientSource | string } & RedisDriverOptions,
+	): AdapterFactory {
+		const { connection, ...driverOptions } = options;
 		const source: RedisClientSource =
-			typeof options.connection === "string"
-				? quasarConnection(options.connection)
-				: options.connection;
-		return () =>
-			new RedisDriver(source, {
-				prefix: options.prefix,
-				visibilityTimeoutMs: options.visibilityTimeoutMs,
-			});
+			typeof connection === "string"
+				? quasarConnection(connection)
+				: connection;
+		return () => new RedisDriver(source, driverOptions);
 	},
 };
 

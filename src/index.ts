@@ -24,7 +24,11 @@ export type {
 	BayProviderConfig,
 } from "./BayProvider.js";
 export { MemoryDriver } from "./drivers/MemoryDriver.js";
-export type { RedisClient } from "./drivers/RedisDriver.js";
+export type {
+	RedisClient,
+	RedisClientSource,
+	RedisDriverOptions,
+} from "./drivers/RedisDriver.js";
 export { RedisDriver } from "./drivers/RedisDriver.js";
 export {
 	DEFAULT_QUEUE,
