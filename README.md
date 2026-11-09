@@ -138,29 +138,17 @@ look like it worked until a restart dropped every pending job.
 bay never imports quasar, which stays an optional peer. Pass an ioredis-shaped
 client (or a function answering one) to use any other.
 
-## Delivery guarantee, and the one way to lose it
+## Delivery guarantee
 
-A job the queue accepted gets run: `pop()` moves it from pending to processing
-in a single `LMOVE`, so a worker that dies mid-job leaves the job recoverable
-rather than gone.
+A job the queue accepted gets run. On Redis every move of a job — taken off a
+queue, completed, retried, failed, promoted from its delay, reclaimed from a
+dead worker — is **one server-side script**, so it happens entirely or not at
+all. A connection dropped halfway through a move leaves the job where it was,
+never in neither place. Scripts need nothing newer than Redis 2.6; the client
+must answer `eval` (ioredis and every `@c9up/quasar` connection do).
 
-`LMOVE` needs **Redis 6.2 or later**. Without it the move is `lpop` then
-`rpush`, and a crash between the two deletes the job from pending before it
-reaches processing — nothing recovers it, because nothing knows it existed.
-That turns at-least-once delivery into at-most-once.
-
-So on an older Redis the driver **refuses to start in production**, and says
-which two ways out there are:
-
-```ts
-// Either upgrade the server, or state that losing a job is acceptable here:
-drivers.redis({ connection: 'jobs', allowNonAtomicPop: true })
-```
-
-The opt-in is honoured and still logs a warning on every process that starts
-with it, naming production — agreeing once in a config file is not the same as
-being reminded, in the logs of an incident, that this is how the process was
-running. Outside production the fallback simply warns.
+A record that can never run — unreadable JSON, a shape no version of bay wrote —
+is filed in the failed list with the reason, rather than deleted.
 
 ## A worker that dies, and a handler that is merely slow
 
@@ -175,8 +163,11 @@ Two things follow, and both are handled rather than left to the deployment:
 worker renews its own lease — half the timeout, so one slow round-trip is not
 enough to lose the job. Without that, any handler outliving 30 s was recovered
 and re-delivered *while it was still running*, and the same job ran twice.
-Renewal is refused once the lease is gone or has passed to another worker, so a
-late heartbeat cannot resurrect somebody else's claim.
+Every pop takes a lease token of its own, and only its holder may renew,
+complete, retry or fail the job. A worker whose lease lapsed — its job reclaimed
+and taken by another — can no longer touch the new owner's claim: its late
+heartbeat is refused (and the heartbeat stops, saying so), and its completion
+changes nothing.
 
 **A job that kills its worker is bounded.** A crash never reaches the failure
 path, so `attempts` never moves and `maxAttempts` never applies — a job that
@@ -189,7 +180,7 @@ drivers.redis({
   connection: 'jobs',
   visibilityTimeoutMs: 30_000, // how long a worker owns a job it took
   maxStalledCount: 1,          // reclaims allowed before the job is failed
-  maxFailedJobs: 1_000,        // failed jobs kept (needs LTRIM on the client)
+  maxFailedJobs: 1_000,        // failed jobs kept, 0 for all
 })
 ```
 

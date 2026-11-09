@@ -1,85 +1,18 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
 	type RedisClient,
 	RedisDriver,
 } from "../../src/drivers/RedisDriver.js";
 import type { JobRecord } from "../../src/QueueManager.js";
-
-/** Narrow away null/undefined without a `!` non-null assertion (which lies to the compiler). */
-function defined<T>(value: T | null | undefined): T {
-	if (value == null) throw new Error("expected a defined value");
-	return value;
-}
-
-function createFakeRedis(opts?: { withLmove?: boolean }): {
-	client: RedisClient;
-	lists: Map<string, string[]>;
-	keys: Map<string, string>;
-} {
-	const lists = new Map<string, string[]>();
-	const keys = new Map<string, string>();
-
-	const ensureList = (k: string): string[] => {
-		const v = lists.get(k);
-		if (v) return v;
-		const fresh: string[] = [];
-		lists.set(k, fresh);
-		return fresh;
-	};
-
-	const client: RedisClient = {
-		async rpush(key, ...values) {
-			ensureList(key).push(...values);
-			return ensureList(key).length;
-		},
-		async lpop(key) {
-			const list = lists.get(key);
-			if (!list || list.length === 0) return null;
-			return list.shift() ?? null;
-		},
-		async lrem(key, _count, element) {
-			const list = lists.get(key);
-			if (!list) return 0;
-			const idx = list.indexOf(element);
-			if (idx < 0) return 0;
-			list.splice(idx, 1);
-			return 1;
-		},
-		async llen(key) {
-			return lists.get(key)?.length ?? 0;
-		},
-		async lrange(key, start, stop) {
-			const list = lists.get(key);
-			if (!list) return [];
-			const end = stop === -1 ? list.length : stop + 1;
-			return list.slice(start, end);
-		},
-		async del(key) {
-			const had = (lists.delete(key) ? 1 : 0) + (keys.delete(key) ? 1 : 0);
-			return had;
-		},
-		async set(key, value) {
-			keys.set(key, value);
-			return "OK";
-		},
-		async get(key) {
-			return keys.get(key) ?? null;
-		},
-	};
-
-	if (opts?.withLmove !== false) {
-		client.lmove = async (source, destination, _from, _to) => {
-			const list = lists.get(source);
-			if (!list || list.length === 0) return null;
-			const v = list.shift();
-			if (v === undefined) return null;
-			ensureList(destination).push(v);
-			return v;
-		};
-	}
-
-	return { client, lists, keys };
-}
+import { quasarConnection } from "../../src/quasar.js";
+import { defined } from "../__helpers__/defined.js";
+import {
+	describeRedis,
+	entriesUnder,
+	freshPrefix,
+	intercept,
+	useRedis,
+} from "../__helpers__/redis.js";
 
 function makeJob(over: Partial<JobRecord> = {}): JobRecord {
 	return {
@@ -94,485 +27,205 @@ function makeJob(over: Partial<JobRecord> = {}): JobRecord {
 	};
 }
 
+/** A client nothing is ever sent to: enough for what the constructor checks. */
+function inertClient(): RedisClient {
+	const never = async (): Promise<never> => {
+		throw new Error("not connected");
+	};
+	return {
+		eval: never,
+		rpush: never,
+		zadd: never,
+		llen: never,
+		zcard: never,
+		lrange: never,
+	};
+}
+
 describe("bay > RedisDriver > config validation", () => {
-	it("rejects a non-positive / non-integer visibilityTimeoutMs (else pop() loses jobs)", () => {
-		const fake = createFakeRedis();
+	it("rejects a non-positive / non-integer visibilityTimeoutMs", () => {
 		for (const bad of [0, -1, 1.5, Number.NaN]) {
 			expect(
-				() => new RedisDriver(fake.client, { visibilityTimeoutMs: bad }),
+				() => new RedisDriver(inertClient(), { visibilityTimeoutMs: bad }),
 			).toThrow(/visibilityTimeoutMs must be a positive integer/);
 		}
-		// A valid positive integer — and the default — construct fine.
 		expect(
-			() => new RedisDriver(fake.client, { visibilityTimeoutMs: 5000 }),
+			() => new RedisDriver(inertClient(), { visibilityTimeoutMs: 5000 }),
 		).not.toThrow();
-		expect(() => new RedisDriver(fake.client)).not.toThrow();
+	});
+
+	/** A client shaped like one from before scripts — no `eval`. */
+	function withoutEval(): object {
+		const client = { ...inertClient() };
+		Reflect.deleteProperty(client, "eval");
+		return client;
+	}
+
+	it("refuses a client that cannot run a script", () => {
+		expect(() => Reflect.construct(RedisDriver, [withoutEval()])).toThrow(
+			/needs EVAL/,
+		);
+	});
+
+	it("refuses it when the client comes from a resolver too", async () => {
+		const driver: unknown = Reflect.construct(RedisDriver, [
+			() => withoutEval(),
+		]);
+		if (!(driver instanceof RedisDriver)) throw new Error("expected a driver");
+		await expect(driver.size()).rejects.toThrow(/needs EVAL/);
 	});
 });
 
-describe("bay > RedisDriver > push/pop", () => {
+describeRedis("bay > RedisDriver against a live Redis", () => {
+	const redis = useRedis();
+	const connection = () => redis.manager.connection("w0");
+
+	async function driverFor(
+		label: string,
+		options: { visibilityTimeoutMs?: number } = {},
+	): Promise<{ driver: RedisDriver; prefix: string }> {
+		const prefix = freshPrefix(label);
+		return {
+			prefix,
+			driver: new RedisDriver(await redis.client(), { prefix, ...options }),
+		};
+	}
+
 	it("push enqueues a serialized job onto the pending list", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
+		const { driver, prefix } = await driverFor("push");
 		await driver.push(makeJob());
-		const pending = fake.lists.get("queue:pending") ?? [];
+		const pending = await connection().lrange(`${prefix}pending`, 0, -1);
 		expect(pending).toHaveLength(1);
 		expect(JSON.parse(defined(pending[0])).id).toBe("job_x");
 	});
 
-	it("pop with LMOVE moves the job from pending → processing atomically", async () => {
-		const fake = createFakeRedis({ withLmove: true });
-		const driver = new RedisDriver(fake.client);
+	it("pop moves the job into processing under a lease that expires", async () => {
+		const { driver, prefix } = await driverFor("pop", {
+			visibilityTimeoutMs: 5000,
+		});
 		await driver.push(makeJob({ id: "j1" }));
-		const popped = await driver.pop();
-		expect(popped?.id).toBe("j1");
-		expect(fake.lists.get("queue:pending")).toEqual([]);
-		expect(fake.lists.get("queue:processing")?.length).toBe(1);
+		const job = await driver.pop();
+		expect(job?.id).toBe("j1");
+		expect(await connection().llen(`${prefix}pending`)).toBe(0);
+		expect(await connection().llen(`${prefix}processing`)).toBe(1);
+		const ttl = await connection().pttl(`${prefix}lease:j1`);
+		expect(ttl).toBeGreaterThan(0);
+		expect(ttl).toBeLessThanOrEqual(5000);
 	});
 
-	it("pop falls back to LPOP+RPUSH when LMOVE is unavailable", async () => {
-		const fake = createFakeRedis({ withLmove: false });
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-		const driver = new RedisDriver(fake.client);
-		// The at-most-once downgrade must be surfaced, not silent (audit 2026-06-13).
-		expect(warn).toHaveBeenCalledWith(expect.stringContaining("at-most-once"));
-		await driver.push(makeJob({ id: "j1" }));
-		const popped = await driver.pop();
-		expect(popped?.id).toBe("j1");
-		expect(fake.lists.get("queue:processing")?.length).toBe(1);
-		warn.mockRestore();
-	});
-
-	it("pop sets a lease key with PX visibilityTimeout", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client, { visibilityTimeoutMs: 5000 });
-		await driver.push(makeJob({ id: "j1" }));
-		const setSpy = vi.spyOn(fake.client, "set");
-		await driver.pop();
-		const args = setSpy.mock.calls[0];
-		expect(args).toBeDefined();
-		expect(args?.[0]).toBe("queue:lease:j1");
-		expect(args?.slice(2)).toEqual(["PX", "5000"]);
-	});
-
-	it("pop returns null when the pending list is empty", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
+	it("pop returns null when the queue is empty, or when no queue is named", async () => {
+		const { driver } = await driverFor("empty");
 		expect(await driver.pop()).toBeNull();
+		await driver.push(makeJob());
+		expect(await driver.pop([])).toBeNull();
 	});
 
-	it("pop returns null when the popped value is malformed JSON", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		await fake.client.rpush("queue:pending", "not-valid-json");
-		expect(await driver.pop()).toBeNull();
+	it("pop serves the queues in the order given", async () => {
+		const { driver } = await driverFor("order");
+		await driver.push(makeJob({ id: "low", queue: "low" }));
+		await driver.push(makeJob({ id: "high", queue: "high" }));
+		expect((await driver.pop(["high", "low"]))?.id).toBe("high");
+		expect((await driver.pop(["high", "low"]))?.id).toBe("low");
 	});
 
-	it("pop returns null when the popped value is JSON but not a JobRecord shape", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		await fake.client.rpush("queue:pending", JSON.stringify({ foo: "bar" }));
-		expect(await driver.pop()).toBeNull();
-	});
-});
-
-describe("bay > RedisDriver > complete/fail/retry", () => {
 	it("complete removes the job from processing and deletes its lease", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const job = makeJob({ id: "j1" });
-		await driver.push(job);
-		await driver.pop();
-		await driver.complete(job);
-		expect(fake.lists.get("queue:processing")?.length).toBe(0);
-		expect(fake.keys.has("queue:lease:j1")).toBe(false);
+		const { driver, prefix } = await driverFor("complete");
+		await driver.push(makeJob({ id: "j1" }));
+		await driver.complete(defined(await driver.pop()));
+		expect(await entriesUnder(redis.manager, prefix)).toEqual({});
 	});
 
 	it("fail moves the job to the failed list and records the error", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const job = makeJob({ id: "j1" });
-		await driver.push(job);
-		await driver.pop();
-		await driver.fail(job, "transient failure");
-
-		expect(fake.lists.get("queue:processing")?.length).toBe(0);
-		const failedRaw = fake.lists.get("queue:failed")?.[0];
-		expect(failedRaw).toBeDefined();
-		const failed = JSON.parse(defined(failedRaw));
-		expect(failed.error).toBe("transient failure");
-		expect(failed.status).toBe("failed");
-	});
-
-	it("retry resets job to pending and re-enqueues it", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const job = makeJob({ id: "j1" });
-		await driver.push(job);
-		await driver.pop();
-		await driver.retry(job);
-
-		expect(fake.lists.get("queue:processing")?.length).toBe(0);
-		const pending = fake.lists.get("queue:pending");
-		expect(pending?.length).toBe(1);
-		expect(JSON.parse(defined(defined(pending)[0])).status).toBe("pending");
-	});
-});
-
-describe("bay > RedisDriver > recoverStale", () => {
-	it("moves processing jobs whose lease has expired back to pending", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const j1 = makeJob({ id: "j1" });
-		const j2 = makeJob({ id: "j2" });
-		await driver.push(j1);
-		await driver.push(j2);
-		await driver.pop(); // j1 → processing + lease set
-		await driver.pop(); // j2 → processing + lease set
-
-		// Simulate j1's lease expiring (delete its lease key).
-		fake.keys.delete("queue:lease:j1");
-
-		const recovered = await driver.recoverStale();
-		expect(recovered).toBe(1);
-		// j1 should be back in pending; j2 still in processing.
-		expect(fake.lists.get("queue:pending")?.length).toBe(1);
-		expect(
-			JSON.parse(defined(defined(fake.lists.get("queue:pending"))[0])).id,
-		).toBe("j1");
-		expect(fake.lists.get("queue:processing")?.length).toBe(1);
-	});
-
-	it("returns 0 when every processing job still has a valid lease", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		await driver.push(makeJob({ id: "alive" }));
-		await driver.pop();
-		expect(await driver.recoverStale()).toBe(0);
-	});
-
-	it("skips malformed JSON in the processing list (no crash)", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		await fake.client.rpush("queue:processing", "not-json");
-		expect(await driver.recoverStale()).toBe(0);
-	});
-
-	it("skips processing entries that aren't valid JobRecord shapes", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		await fake.client.rpush(
-			"queue:processing",
-			JSON.stringify({ partial: true }),
-		);
-		expect(await driver.recoverStale()).toBe(0);
-	});
-});
-
-describe("bay > RedisDriver > failed() / size()", () => {
-	it("failed() returns parsed JobRecord objects, filtering out malformed entries", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const j = makeJob({ id: "ok", error: "boom" });
-		await fake.client.rpush("queue:failed", JSON.stringify(j));
-		await fake.client.rpush("queue:failed", "garbage");
-		await fake.client.rpush("queue:failed", JSON.stringify({ not: "a job" }));
+		const { driver, prefix } = await driverFor("fail");
+		await driver.push(makeJob({ id: "j1" }));
+		await driver.fail(defined(await driver.pop()), "handler threw");
+		expect(await connection().llen(`${prefix}processing`)).toBe(0);
 		const failed = await driver.failed();
-		expect(failed).toHaveLength(1);
-		expect(failed[0]?.id).toBe("ok");
+		expect(failed.map((j) => [j.id, j.status, j.error])).toEqual([
+			["j1", "failed", "handler threw"],
+		]);
 	});
 
-	it("size() returns LLEN of the pending list", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
+	it("retry puts the job back in its own queue, or in its delayed set when it carries a future runAt", async () => {
+		const { driver, prefix } = await driverFor("retry");
+		await driver.push(makeJob({ id: "now", queue: "emails" }));
+		await driver.push(makeJob({ id: "later", queue: "emails" }));
+
+		const now = defined(await driver.pop(["emails"]));
+		await driver.retry(now);
+		const later = defined(await driver.pop(["emails"]));
+		later.runAt = Date.now() + 60_000;
+		await driver.retry(later);
+
+		expect(
+			(await connection().lrange(`${prefix}q:emails:pending`, 0, -1)).map(
+				(raw) => JSON.parse(raw).id,
+			),
+		).toEqual(["now"]);
+		expect(await connection().zcard(`${prefix}q:emails:delayed`)).toBe(1);
+		expect(await driver.size("emails")).toBe(2);
+	});
+
+	it("does not settle a record it never took", async () => {
+		const { driver, prefix } = await driverFor("foreign");
+		await driver.push(makeJob({ id: "j1" }));
+		const before = await entriesUnder(redis.manager, prefix);
+		await driver.complete(makeJob({ id: "j1" }));
+		await driver.fail(makeJob({ id: "j1" }), "nope");
+		expect(await entriesUnder(redis.manager, prefix)).toEqual(before);
+	});
+
+	it("recoverStale moves an expired job back to pending and leaves a leased one", async () => {
+		const { driver, prefix } = await driverFor("recover");
 		await driver.push(makeJob({ id: "a" }));
 		await driver.push(makeJob({ id: "b" }));
-		expect(await driver.size()).toBe(2);
-	});
-});
-
-describe("bay > RedisDriver > custom prefix", () => {
-	it("respects a custom prefix on every key namespace", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client, { prefix: "myapp:" });
-		await driver.push(makeJob({ id: "j" }));
-		expect(fake.lists.has("myapp:pending")).toBe(true);
 		await driver.pop();
-		expect(fake.keys.has("myapp:lease:j")).toBe(true);
+		await driver.pop();
+		await connection().del(`${prefix}lease:a`);
+
+		expect(await driver.recoverStale()).toBe(1);
+		const pending = await connection().lrange(`${prefix}pending`, 0, -1);
+		expect(pending.map((raw) => JSON.parse(raw).id)).toEqual(["a"]);
+		expect(JSON.parse(defined(pending[0])).stalledCount).toBe(1);
+		expect(await connection().llen(`${prefix}processing`)).toBe(1);
 	});
 
-	it("adds the separator a prefix is missing", async () => {
-		// Every key is built by concatenation, so "myapp" produced
-		// "myapppending" — unreadable, and able to collide with a neighbouring
-		// prefix. Nothing warned, because nothing failed.
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client, { prefix: "myapp" });
-		await driver.push(makeJob({ id: "j" }));
-		expect(fake.lists.has("myapp:pending")).toBe(true);
-		expect(fake.lists.has("myapppending")).toBe(false);
+	it("respects a custom prefix, adding the separator it is missing", async () => {
+		const base = freshPrefix("custom").slice(0, -1);
+		const driver = new RedisDriver(await redis.client(), { prefix: base });
+		await driver.push(makeJob());
+		expect(await connection().llen(`${base}:pending`)).toBe(1);
+		expect(await connection().exists(`${base}pending`)).toBe(0);
 	});
 
-	it("leaves a prefix that already ends in a separator alone", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client, { prefix: "myapp." });
-		await driver.push(makeJob({ id: "j" }));
-		expect(fake.lists.has("myapp.pending")).toBe(true);
-	});
-});
+	it("sends each script once and addresses it by digest afterwards", async () => {
+		const prefix = freshPrefix("evalsha");
+		// Forget every script, so the first call has to send it.
+		await connection().script("FLUSH");
+		const calls: string[] = [];
+		const client = intercept(await redis.client(), (command, run) => {
+			calls.push(command);
+			return run();
+		});
+		const driver = new RedisDriver(client, { prefix });
+		await driver.push(makeJob({ id: "a" }));
+		await driver.push(makeJob({ id: "b" }));
 
-describe("bay > RedisDriver > processing-list fallback removal", () => {
-	it("falls back to scanning the processing list when the lease is missing", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const job = makeJob({ id: "scanned" });
-		await driver.push(job);
-		const popped = await driver.pop();
-		expect(popped?.id).toBe("scanned");
-		// Manually drop the lease so RedisDriver#removeFromProcessing falls
-		// through to the lrange/lrem scan path (lines 170-180 in RedisDriver.ts).
-		await fake.client.del("queue:lease:scanned");
-		await driver.complete(job);
-		const remaining = fake.lists.get("queue:processing") ?? [];
-		expect(remaining).toEqual([]);
-	});
+		await driver.pop();
+		await driver.pop();
 
-	it("scan ignores malformed JSON entries in the processing list", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const job = makeJob({ id: "real" });
-		await fake.client.rpush("queue:processing", "{{not-json");
-		await fake.client.rpush("queue:processing", JSON.stringify(job));
-		await driver.complete(job);
-		const remaining = fake.lists.get("queue:processing") ?? [];
-		expect(remaining).toEqual(["{{not-json"]);
-	});
-});
-
-describe("bay > RedisDriver > the shapes it refuses", () => {
-	it("refuses a popped value that is not an object at all", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-
-		// Valid JSON that is not a job — a `null`, a number, an array. Trusting
-		// it would put a non-job through the handler.
-		for (const value of ["null", "42", '"a string"', "[]"]) {
-			await fake.client.rpush("queue:pending", value);
-			expect(await driver.pop(), value).toBeNull();
-		}
+		// At most one full send (another test file may load the same script
+		// first), always after a digest attempt, and the digest afterwards.
+		const scripted = calls.filter((c) => c === "eval" || c === "evalsha");
+		expect(scripted.filter((c) => c === "eval").length).toBeLessThanOrEqual(1);
+		expect(scripted[0]).toBe("evalsha");
+		expect(scripted.at(-1)).toBe("evalsha");
 	});
 
-	it("refuses a job-shaped object with one field of the wrong type", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		const complete = {
-			id: "1",
-			name: "welcome",
-			attempts: 0,
-			maxAttempts: 3,
-			status: "pending",
-			payload: {},
-		};
-
-		for (const field of ["id", "name", "attempts", "maxAttempts", "status"]) {
-			await fake.client.rpush(
-				"queue:pending",
-				JSON.stringify({ ...complete, [field]: { wrong: true } }),
-			);
-			expect(await driver.pop(), field).toBeNull();
-		}
-	});
-});
-
-describe("bay > RedisDriver > removing a job whose lease is gone", () => {
-	it("finds it by id and removes the entry that is actually stored", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		await driver.push(makeJob({ id: "j1" }));
-		const job = defined(await driver.pop());
-		// The lease is what `complete` normally matches on; without it the
-		// driver has to fall back to scanning the processing list, or the job
-		// stays there forever and gets recovered as stale.
-		await fake.client.del(`queue:lease:${job.id}`);
-
-		await driver.complete(job);
-
-		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(0);
-	});
-
-	it("leaves the list alone when nothing in it matches", async () => {
-		const fake = createFakeRedis();
-		const driver = new RedisDriver(fake.client);
-		await driver.push(makeJob({ id: "j1" }));
-		const job = defined(await driver.pop());
-		await fake.client.del(`queue:lease:${job.id}`);
-		await fake.client.lrem("queue:processing", 1, JSON.stringify(job));
-		await fake.client.rpush("queue:processing", "not json");
-		await fake.client.rpush(
-			"queue:processing",
-			JSON.stringify({ ...job, id: "someone-else" }),
-		);
-
-		await driver.complete(job);
-
-		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(2);
-	});
-});
-
-describe("bay > a Redis without LMOVE is not silently accepted in production", () => {
-	const original = process.env.NODE_ENV;
-	afterEach(() => {
-		process.env.NODE_ENV = original;
-	});
-
-	/** A client from before Redis 6.2: everything but LMOVE. */
-	const oldClient = () => {
-		const { client } = createFakeRedis({ withLmove: false });
-		return client;
-	};
-
-	it("warns outside production and keeps working", () => {
-		process.env.NODE_ENV = "development";
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-		expect(() => new RedisDriver(oldClient())).not.toThrow();
-
-		expect(warn).toHaveBeenCalled();
-		warn.mockRestore();
-	});
-
-	it("refuses in production", () => {
-		process.env.NODE_ENV = "production";
-
-		// The pop becomes lpop+rpush: a crash between the two deletes the job
-		// from pending before it reaches processing, and nothing recovers it
-		// because nothing knows it existed.
-		expect(() => new RedisDriver(oldClient())).toThrow(/no LMOVE/);
-	});
-
-	it("refuses under the `prod` spelling too", () => {
-		process.env.NODE_ENV = "prod";
-
-		expect(() => new RedisDriver(oldClient())).toThrow(/no LMOVE/);
-	});
-
-	it("accepts it when the deployment says so explicitly — and says so loudly", () => {
-		process.env.NODE_ENV = "production";
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-		expect(
-			() => new RedisDriver(oldClient(), { allowNonAtomicPop: true }),
-		).not.toThrow();
-
-		// Agreeing once in a config file is not the same as being reminded
-		// that this process is running that way — the line has to be in the
-		// logs of the incident.
-		expect(warn).toHaveBeenCalledOnce();
-		expect(String(warn.mock.calls[0]?.[0])).toContain("PRODUCTION");
-		warn.mockRestore();
-	});
-
-	it("says nothing when the client has LMOVE", () => {
-		process.env.NODE_ENV = "production";
-		const { client } = createFakeRedis({ withLmove: true });
-
-		expect(() => new RedisDriver(client)).not.toThrow();
-	});
-});
-
-describe("bay > NODE_ENV aliases decide whether the lossy pop is accepted", () => {
-	const original = process.env.NODE_ENV;
-	afterEach(() => {
-		process.env.NODE_ENV = original;
-	});
-
-	const oldClient = () => createFakeRedis({ withLmove: false }).client;
-
-	it("folds every production spelling", () => {
-		for (const value of ["prod", "production", "PROD", "Production"]) {
-			process.env.NODE_ENV = value;
-			expect(() => new RedisDriver(oldClient()), value).toThrow(/no LMOVE/);
-		}
-	});
-
-	it("folds the development and test spellings, which only warn", () => {
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-		for (const value of ["dev", "develop", "development", "test", "testing"]) {
-			process.env.NODE_ENV = value;
-			expect(() => new RedisDriver(oldClient()), value).not.toThrow();
-		}
-		warn.mockRestore();
-	});
-
-	it("treats an unset or unrecognised environment as not production", () => {
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-		process.env.NODE_ENV = "staging";
-		expect(() => new RedisDriver(oldClient())).not.toThrow();
-
-		// Absent is not production either — the refusal is for a deployment
-		// that says it is one.
-		delete process.env.NODE_ENV;
-		expect(() => new RedisDriver(oldClient())).not.toThrow();
-
-		warn.mockRestore();
-	});
-});
-
-describe("bay > a transient Redis failure does not swallow a reserved job", () => {
-	it("leaves the job in processing when the lease cannot be written", async () => {
-		const fake = createFakeRedis({ withLmove: true });
-		const driver = new RedisDriver(fake.client);
-		await driver.push(makeJob({ id: "j1" }));
-		// The move succeeded; the lease write is what blips.
-		fake.client.set = async () => {
-			throw new Error("READONLY You can't write against a replica");
-		};
-
-		await expect(driver.pop()).rejects.toThrow(/READONLY/);
-
-		// Deleting it here would lose it for good: it is already out of
-		// pending, and recoverStale() only ever scans processing.
-		expect(fake.lists.get("queue:processing")).toHaveLength(1);
-	});
-
-	it("and recoverStale puts that job back where a worker will see it", async () => {
-		const fake = createFakeRedis({ withLmove: true });
-		const driver = new RedisDriver(fake.client);
-		await driver.push(makeJob({ id: "j1" }));
-		const set = fake.client.set;
-		fake.client.set = async () => {
-			throw new Error("READONLY");
-		};
-		await driver.pop().catch(() => undefined);
-		fake.client.set = set;
-
-		const recovered = await driver.recoverStale();
-
-		// No lease was ever written, which is exactly the state recoverStale
-		// reclaims. At-least-once survives the blip.
-		expect(recovered).toBe(1);
-		expect(fake.lists.get("queue:pending")).toHaveLength(1);
-		expect(fake.lists.get("queue:processing")).toHaveLength(0);
-	});
-
-	it("still purges a payload that can never be run", async () => {
-		const fake = createFakeRedis({ withLmove: true });
-		const driver = new RedisDriver(fake.client);
-		await fake.client.rpush("queue:pending", "not json at all");
-
-		expect(await driver.pop()).toBeNull();
-
-		// A poison pill is the one case where deleting is right: it would sit
-		// in processing forever, wasting every recovery pass.
-		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(0);
-	});
-
-	it("purges a JSON payload that is not a job either", async () => {
-		const fake = createFakeRedis({ withLmove: true });
-		const driver = new RedisDriver(fake.client);
-		await fake.client.rpush("queue:pending", JSON.stringify({ nope: true }));
-
-		expect(await driver.pop()).toBeNull();
-		expect(fake.lists.get("queue:processing") ?? []).toHaveLength(0);
+	it("resolves a named quasar connection lazily", async () => {
+		const prefix = freshPrefix("named");
+		const driver = new RedisDriver(quasarConnection("w1"), { prefix });
+		await driver.push(makeJob());
+		expect(await driver.size()).toBe(1);
 	});
 });

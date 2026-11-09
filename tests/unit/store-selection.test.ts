@@ -92,15 +92,13 @@ describe("bay > store selection", () => {
 		expect(
 			stores.redis({
 				connection: {
+					eval: async () => null,
 					rpush: async () => 1,
-					lpop: async () => null,
-					lrem: async () => 1,
+					zadd: async () => 1,
 					lrange: async () => [],
 					llen: async () => 0,
-					set: async () => "OK",
-					get: async () => null,
-					del: async () => 1,
-				} as never,
+					zcard: async () => 0,
+				},
 			})(),
 		).toBeInstanceOf(RedisDriver);
 	});

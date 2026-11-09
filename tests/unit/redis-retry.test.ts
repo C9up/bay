@@ -5,17 +5,19 @@
  * new error to explain why the process never recovered.
  */
 import { describe, expect, it, vi } from "vitest";
-import { RedisDriver } from "../../src/drivers/RedisDriver.js";
+import {
+	type RedisClient,
+	RedisDriver,
+} from "../../src/drivers/RedisDriver.js";
 
-const fakeClient = () =>
-	({
-		lpush: async () => 1,
-		rpoplpush: async () => null,
-		lrem: async () => 1,
-		del: async () => 1,
-		llen: async () => 0,
-		lrange: async () => [],
-	}) as never;
+const fakeClient = (): RedisClient => ({
+	eval: async () => null,
+	rpush: async () => 1,
+	zadd: async () => 1,
+	llen: async () => 0,
+	zcard: async () => 0,
+	lrange: async () => [],
+});
 
 describe("bay > redis client resolution", () => {
 	it("retries after a transient failure instead of failing forever", async () => {

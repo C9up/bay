@@ -415,10 +415,22 @@ export class QueueManager {
 			return () => {};
 		}
 		const timer = setInterval(() => {
-			// A renewal that fails is not a reason to interrupt the handler: the
-			// job may already have been recovered, and the handler finishing is
-			// still the best outcome available.
-			void driver.renew?.(job).catch(() => {});
+			// Neither outcome interrupts the handler: finishing is still the best
+			// thing it can do. A refusal means the claim is gone for good — the
+			// job was recovered, maybe taken by another worker — so the heartbeat
+			// stops rather than knocking on a lease it can never hold again, and
+			// says so, because the job may now run twice.
+			driver.renew?.(job).then(
+				(held) => {
+					if (held) return;
+					clearInterval(timer);
+					process.stderr.write(
+						`QueueManager: job '${job.id}' lost its lease while '${job.name}' was running; another worker may take it\n`,
+					);
+				},
+				// A transport error is not a refusal: the next beat may get through.
+				() => {},
+			);
 		}, every);
 		// Unreffed: the handler's own promise is what holds the process open.
 		timer.unref();

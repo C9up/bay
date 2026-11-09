@@ -16,16 +16,7 @@ import queue, { getQueue, setQueue } from "../../src/services/main.js";
 const SPECIFIER = "@c9up/quasar/services/main";
 
 /** Every command the redis driver actually issues. */
-const commands = [
-	"rpush",
-	"lpop",
-	"lrem",
-	"llen",
-	"lrange",
-	"del",
-	"set",
-	"get",
-];
+const commands = ["eval", "rpush", "zadd", "llen", "zcard", "lrange"];
 
 const client = (omit?: string) =>
 	Object.fromEntries(
@@ -128,9 +119,9 @@ describe("bay > the quasar bridge", () => {
 		}
 	});
 
-	it("accepts a connection without lmove", async () => {
-		// The driver declares `lmove` optional and falls back when it is not
-		// there, so demanding it would reject a connection that works.
+	it("accepts a connection without evalsha", async () => {
+		// The driver declares `evalsha` optional and sends scripts in full when
+		// it is not there, so demanding it would reject a connection that works.
 		mockQuasar({ default: { connection: () => client() } });
 
 		await expect((await load())("jobs")()).resolves.toBeDefined();

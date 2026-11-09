@@ -1,109 +1,245 @@
 /**
- * Redis queue driver — FIFO job queue with visibility timeout.
+ * Redis queue driver — FIFO job queue with a visibility lease.
  *
- * Uses LMOVE (Redis 6.2+) for at-least-once delivery:
- * - pop() moves the job from pending → processing (atomic)
- * - complete() removes from processing
- * - If a worker crashes, the job stays in processing
- * - recoverStale() moves expired processing jobs back to pending
+ * Every move of a job between two places is ONE server-side script, so it
+ * happens entirely or not at all:
+ * - pop() promotes due delayed jobs, takes the head of a queue into
+ *   `processing` and writes its lease, in one step
+ * - complete()/fail()/retry() check the caller still holds the lease, then
+ *   remove the entry and put it where it goes next, in one step
+ * - recoverStale() re-checks the lease and moves an orphaned entry back to
+ *   pending (or to failed), in one step per entry
  *
- * Without LMOVE (Redis <6.2) pop() falls back to a non-atomic lpop+rpush, which
- * downgrades delivery to at-most-once — a crash between the two commands drops
- * the in-flight job (recoverStale can't reclaim it, it was never in processing).
- * The constructor warns when the client lacks LMOVE so the downgrade isn't silent.
+ * Done as separate commands, a job was removed from one list before being
+ * written to the next, and a single dropped connection in between lost it for
+ * good. Scripts need nothing newer than Redis 2.6.
  *
- * The client must be ioredis-shaped: lowercase methods and positional options
- * (e.g. set(key, val, "PX", ms)). node-redis v4 (camelCase + options objects like
- * { PX: ms }) does NOT satisfy this interface and would drop the lease TTL — it
- * needs a thin adapter.
+ * A lease is a token unique to one pop. Only the worker holding that token may
+ * renew or settle the job: a worker whose lease lapsed — its job recovered and
+ * taken by somebody else — can no longer touch the new owner's claim.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_QUEUE } from "../Job.js";
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
-import { inProduction } from "../vendor/nodeEnv.js";
 
+/**
+ * The commands this driver issues. ioredis and a `@c9up/quasar` connection
+ * have every one of them.
+ */
 export interface RedisClient {
+	eval(
+		script: string,
+		numKeys: number,
+		...args: (string | number)[]
+	): Promise<unknown>;
+	/** Optional: without it every script is sent in full. */
+	evalsha?(
+		sha1: string,
+		numKeys: number,
+		...args: (string | number)[]
+	): Promise<unknown>;
 	rpush(key: string, ...values: string[]): Promise<number>;
-	lpop(key: string): Promise<string | null>;
-	lmove?(
-		source: string,
-		destination: string,
-		from: "LEFT" | "RIGHT",
-		to: "LEFT" | "RIGHT",
-	): Promise<string | null>;
-	lrem(key: string, count: number, element: string): Promise<number>;
-	/**
-	 * Optional, like `lmove`. Present on ioredis; without it the failed list
-	 * simply keeps its entries, which is what this driver did before.
-	 */
-	ltrim?(key: string, start: number, stop: number): Promise<string>;
+	zadd(key: string, score: number, member: string): Promise<number | string>;
 	llen(key: string): Promise<number>;
+	zcard(key: string): Promise<number>;
 	lrange(key: string, start: number, stop: number): Promise<string[]>;
-	del(key: string): Promise<number>;
-	set(key: string, value: string, ...args: string[]): Promise<string | null>;
-	get(key: string): Promise<string | null>;
+}
+
+/** Options for {@link RedisDriver}, reachable from `drivers.redis()` too. */
+export interface RedisDriverOptions {
+	/** Prefix of every key. A separator is added when missing. Default `queue:`. */
+	prefix?: string;
+	/** How long a worker owns a job it took, in ms. Default `30_000`. */
+	visibilityTimeoutMs?: number;
 	/**
-	 * Sorted-set commands, for delayed jobs. Optional like `lmove`: a client
-	 * without them can still run a queue, and `push` refuses a job carrying a
-	 * `delay` rather than running it early — which is the one thing a delay
-	 * must not do.
+	 * How many times a job may be reclaimed from a stalled worker before it is
+	 * filed as failed instead of pushed round again. Default `1`, upstream's
+	 * default for the same setting.
+	 *
+	 * Unbounded recovery is a job that kills its worker taking the whole queue
+	 * down with it, forever: the crash never reaches the failure path, so
+	 * `attempts` never moves and `maxAttempts` never applies.
 	 */
-	zadd?(key: string, score: number, member: string): Promise<number | string>;
-	zrangebyscore?(
-		key: string,
-		min: number | string,
-		max: number | string,
-		...args: string[]
-	): Promise<string[]>;
-	zrem?(key: string, ...members: string[]): Promise<number>;
-	zcard?(key: string): Promise<number>;
+	maxStalledCount?: number;
+	/** How many failed jobs to keep. Default `1000`. `0` keeps every one. */
+	maxFailedJobs?: number;
 }
 
 function isValidJob(obj: unknown): obj is JobRecord {
 	if (typeof obj !== "object" || obj === null) return false;
+	const maxAttempts: unknown = Reflect.get(obj, "maxAttempts");
 	return (
 		typeof Reflect.get(obj, "id") === "string" &&
 		typeof Reflect.get(obj, "name") === "string" &&
 		typeof Reflect.get(obj, "attempts") === "number" &&
-		typeof Reflect.get(obj, "maxAttempts") === "number" &&
+		typeof maxAttempts === "number" &&
+		Number.isSafeInteger(maxAttempts) &&
+		maxAttempts >= 1 &&
 		typeof Reflect.get(obj, "status") === "string"
 	);
 }
 
-/**
- * What a lease holds: the exact string pop() moved into `processing`, and the
- * worker that moved it.
- *
- * The owner is what makes renewal safe. Without it a worker whose lease had
- * already expired — its job recovered, re-popped by somebody else — would go on
- * extending the deadline of a job it no longer had any claim on. Upstream draws
- * the same line inside its renewal script: "Only the worker that currently owns
- * the lease may renew it."
- */
-interface Lease {
-	owner: string;
-	raw: string;
+/** What can be read off a record that cannot run. */
+interface Unreadable {
+	reason: string;
+	id?: string;
+	name?: string;
+	queue?: string;
+}
+
+type Parsed = { ok: true; job: JobRecord } | ({ ok: false } & Unreadable);
+
+function stringField(obj: object, key: string): string | undefined {
+	const value: unknown = Reflect.get(obj, key);
+	return typeof value === "string" ? value : undefined;
+}
+
+/** Read a stored record, saying what is wrong with one that cannot run. */
+function parseJob(raw: string): Parsed {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return { ok: false, reason: "not JSON" };
+	}
+	if (isValidJob(parsed)) return { ok: true, job: parsed };
+	if (typeof parsed !== "object" || parsed === null) {
+		return { ok: false, reason: "not an object" };
+	}
+	return {
+		ok: false,
+		reason: "not a job record (id, name, attempts, maxAttempts >= 1, status)",
+		id: stringField(parsed, "id"),
+		name: stringField(parsed, "name"),
+		queue: stringField(parsed, "queue"),
+	};
+}
+
+/** A script, with the digest `EVALSHA` addresses it by. */
+interface Script {
+	lua: string;
+	sha: string;
+}
+
+function script(lua: string): Script {
+	return { lua, sha: createHash("sha1").update(lua).digest("hex") };
 }
 
 /**
- * Read a lease back. A value written by an older version of this driver is the
- * raw job string on its own, with no owner — still usable for the one thing
- * `#removeFromProcessing` needs it for.
+ * Promote the due delayed jobs of each queue, take the first job found, and
+ * lease it — one step, so a recovery pass can never see the job in
+ * `processing` without its lease.
+ *
+ * The id is read straight off the record (`dispatch` writes it first); the
+ * decoder is the fallback for a record written in another key order. A record
+ * neither can read is taken without a lease, and the caller files it as failed.
  */
-function readLease(stored: string): { owner?: string; raw: string } {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(stored);
-	} catch {
-		return { raw: stored };
-	}
-	if (typeof parsed !== "object" || parsed === null) return { raw: stored };
-	const raw = Reflect.get(parsed, "raw");
-	const owner = Reflect.get(parsed, "owner");
-	if (typeof raw !== "string" || typeof owner !== "string") {
-		return { raw: stored };
-	}
-	return { owner, raw };
+const ACQUIRE = script(String.raw`
+local processing = KEYS[1]
+local now = ARGV[1]
+local token = ARGV[2]
+local ttl = ARGV[3]
+local lease_prefix = ARGV[4]
+
+local function job_id(raw)
+  local id = string.match(raw, '^{"id":"([^"\\]+)"')
+  if id then return id end
+  local ok, decoded = pcall(cjson.decode, raw)
+  if ok and type(decoded) == 'table' and type(decoded.id) == 'string' and decoded.id ~= '' then
+    return decoded.id
+  end
+  return nil
+end
+
+for i = 2, #KEYS, 2 do
+  local pending = KEYS[i]
+  local delayed = KEYS[i + 1]
+  local due = redis.call('ZRANGEBYSCORE', delayed, '-inf', now, 'LIMIT', 0, 100)
+  for _, raw in ipairs(due) do
+    redis.call('ZREM', delayed, raw)
+    redis.call('RPUSH', pending, raw)
+  end
+  local raw = redis.call('LPOP', pending)
+  if raw then
+    redis.call('RPUSH', processing, raw)
+    local id = job_id(raw)
+    if id then
+      redis.call('SET', lease_prefix .. id, token, 'PX', ttl)
+      return { raw, id }
+    end
+    return { raw }
+  end
+end
+return false
+`);
+
+/** Extend a lease, only for the worker that holds it. */
+const RENEW = script(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  return 1
+end
+return 0
+`);
+
+/**
+ * Settle a job the caller holds: drop its entry and lease, and put it where it
+ * goes next. A caller whose lease is gone changes nothing.
+ *
+ * KEYS: lease, processing, destination. ARGV: token, stored entry, mode
+ * (`complete` | `list` | `zset` | `failed`), new entry, score or failed cap.
+ */
+const SETTLE = script(`
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('LREM', KEYS[2], 1, ARGV[2])
+redis.call('DEL', KEYS[1])
+local mode = ARGV[3]
+if mode == 'list' then
+  redis.call('RPUSH', KEYS[3], ARGV[4])
+elseif mode == 'zset' then
+  redis.call('ZADD', KEYS[3], ARGV[5], ARGV[4])
+elseif mode == 'failed' then
+  redis.call('RPUSH', KEYS[3], ARGV[4])
+  local keep = tonumber(ARGV[5])
+  if keep > 0 then
+    redis.call('LTRIM', KEYS[3], -keep, -1)
+  end
+end
+return 1
+`);
+
+/**
+ * Move one orphaned entry out of `processing`, unless it is leased after all.
+ * The LREM is the claim: of two passes over the same entry, one moves it.
+ *
+ * KEYS: processing, destination, lease (empty when the record has no id).
+ * ARGV: stored entry, mode (`list` | `failed`), new entry, failed cap.
+ */
+const RECOVER = script(`
+if KEYS[3] ~= '' and redis.call('EXISTS', KEYS[3]) == 1 then
+  return 0
+end
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+  return 0
+end
+redis.call('RPUSH', KEYS[2], ARGV[3])
+if ARGV[2] == 'failed' then
+  local keep = tonumber(ARGV[4])
+  if keep > 0 then
+    redis.call('LTRIM', KEYS[2], -keep, -1)
+  end
+end
+return 1
+`);
+
+/** What a pop holds: its lease token, and the exact entry it put in processing. */
+interface Claim {
+	token: string;
+	raw: string;
+	id: string;
 }
 
 /**
@@ -116,45 +252,11 @@ export type RedisClientSource =
 	| RedisClient
 	| (() => RedisClient | Promise<RedisClient>);
 
-/**
- * LMOVE (Redis 6.2+) is what makes pop() atomic. Warned once, when the client
- * is resolved rather than at construction — a driver that names its connection
- * has no client to inspect yet.
- */
-const warned = new WeakSet<object>();
-function checkLmove(client: RedisClient, allowNonAtomicPop: boolean): void {
-	if (typeof client.lmove === "function") return;
-
-	// A queue's whole promise is that a job it accepted gets run. Without LMOVE
-	// the pop is `lpop` then `rpush`, and a crash between the two deletes the
-	// job from pending before it reaches processing: nothing recovers it,
-	// because nothing knows it existed. That is a different product, and in
-	// production it must be asked for rather than fallen into.
-	// Read through `inProduction()` rather than `NODE_ENV === "production"`:
-	// `NODE_ENV=prod` is ordinary in a Dockerfile, and taken verbatim it answers
-	// "not production" — so this queue would silently accept a delivery
-	// guarantee weaker than the one it advertises.
-	if (inProduction() && !allowNonAtomicPop) {
-		throw new Error(
-			"[bay] this Redis client has no LMOVE (Redis < 6.2), so pop() would be a non-atomic lpop+rpush — " +
-				"a crash between the two loses the in-flight job, turning at-least-once delivery into at-most-once.\n" +
-				"  Upgrade to Redis 6.2 or later, or pass `allowNonAtomicPop: true` to state that losing a job is acceptable here.",
-		);
-	}
-	if (warned.has(client)) return;
-	warned.add(client);
-
-	// Said even when the deployment opted in: agreeing to lose a job once, in a
-	// config file, is not the same as being reminded that this process is
-	// running that way. The line has to be in the logs of the incident.
-	const optedIn = inProduction() && allowNonAtomicPop;
-	console.warn(
-		"[bay] RedisDriver: client lacks LMOVE (Redis <6.2). pop() falls back to " +
-			"a non-atomic lpop+rpush, downgrading delivery from at-least-once to " +
-			"at-most-once — a crash between the two commands loses the in-flight job." +
-			(optedIn
-				? "\n  Running this way in PRODUCTION because allowNonAtomicPop was set."
-				: ""),
+function checkClient(client: RedisClient): void {
+	if (typeof client.eval === "function") return;
+	throw new Error(
+		"[bay] RedisDriver needs EVAL (Redis 2.6+): every move of a job is one server-side script, " +
+			"so that a dropped connection can never leave it half-moved. ioredis and @c9up/quasar connections have it.",
 	);
 }
 
@@ -169,12 +271,40 @@ function withSeparator(prefix: string): string {
 	return /[:.\-_/]$/.test(prefix) ? prefix : `${prefix}:`;
 }
 
+function isNoScript(err: unknown): boolean {
+	return err instanceof Error && err.message.startsWith("NOSCRIPT");
+}
+
+/** The entry and id the acquire script answered with, or `null` for none. */
+function readAcquired(reply: unknown): { raw: string; id?: string } | null {
+	if (reply === null || reply === false || reply === undefined) return null;
+	if (!Array.isArray(reply) || typeof reply[0] !== "string") {
+		throw new Error("[bay] unexpected reply from the acquire script");
+	}
+	const id: unknown = reply[1];
+	return { raw: reply[0], id: typeof id === "string" ? id : undefined };
+}
+
+/** A stable id for a record that has none of its own. */
+function digestId(raw: string): string {
+	return `invalid_${createHash("sha1").update(raw).digest("hex").slice(0, 16)}`;
+}
+
 export class RedisDriver implements QueueDriver {
 	#source: RedisClientSource;
 	#resolved: RedisClient | undefined;
 	#pending: Promise<RedisClient> | undefined;
 	#prefix: string;
 	#visibilityTimeout: number;
+	#maxStalledCount: number;
+	#maxFailedJobs: number;
+	/** This driver instance, as a lease owner. */
+	#workerId = randomUUID();
+	/**
+	 * The lease each record this driver popped is held under. Keyed by the
+	 * record object, which is what `QueueManager` hands back to settle it.
+	 */
+	#claims = new WeakMap<JobRecord, Claim>();
 
 	/**
 	 * The client, resolved once. Two workers racing on a cold queue must not
@@ -183,22 +313,21 @@ export class RedisDriver implements QueueDriver {
 	async #client(): Promise<RedisClient> {
 		if (this.#resolved) return this.#resolved;
 		if (typeof this.#source !== "function") {
+			checkClient(this.#source);
 			this.#resolved = this.#source;
-			checkLmove(this.#resolved, this.#allowNonAtomicPop);
 			return this.#resolved;
 		}
 		if (!this.#pending) {
 			const resolver = this.#source;
 			this.#pending = Promise.resolve(resolver())
 				.then((client) => {
+					checkClient(client);
 					this.#resolved = client;
-					checkLmove(client, this.#allowNonAtomicPop);
 					return client;
 				})
 				// Cleared on failure too. Clearing only on success left the
 				// REJECTED promise cached forever, so one transient outage at
-				// startup broke every later call for the life of the process —
-				// a permanent failure with no error of its own to explain it.
+				// startup broke every later call for the life of the process.
 				.finally(() => {
 					this.#pending = undefined;
 				});
@@ -206,54 +335,19 @@ export class RedisDriver implements QueueDriver {
 		return this.#pending;
 	}
 
-	constructor(
-		source: RedisClientSource,
-		options?: {
-			prefix?: string;
-			visibilityTimeoutMs?: number;
-			/**
-			 * Accept the non-atomic pop on a Redis older than 6.2, in
-			 * production. Off by default: losing an accepted job is a choice a
-			 * deployment makes, not one a version check makes for it.
-			 */
-			allowNonAtomicPop?: boolean;
-			/**
-			 * How many times a job may be reclaimed from a stalled worker before
-			 * it is filed as failed instead of pushed round again. Default `1`,
-			 * upstream's default for the same setting.
-			 *
-			 * Unbounded recovery is a job that kills its worker taking the whole
-			 * queue down with it, forever: the crash never reaches the failure
-			 * path, so `attempts` never moves and `maxAttempts` never applies.
-			 */
-			maxStalledCount?: number;
-			/**
-			 * How many failed jobs to keep. Default `1000` — the ceiling the
-			 * memory driver already had. `0` keeps every one of them.
-			 *
-			 * Only enforced when the client answers `ltrim`.
-			 */
-			maxFailedJobs?: number;
-		},
-	) {
+	constructor(source: RedisClientSource, options?: RedisDriverOptions) {
 		this.#source = source;
-		// A client handed in directly can be checked now, so the warning keeps
-		// landing at construction as it always did. A named connection has no
-		// client yet — it is checked when the connection resolves.
-		if (typeof source !== "function") {
-			checkLmove(source, options?.allowNonAtomicPop ?? false);
-		}
+		// A client handed in directly can be checked now. A named connection
+		// has no client yet — it is checked when the connection resolves.
+		if (typeof source !== "function") checkClient(source);
 		// Normalised rather than documented: every key is built by concatenation
 		// (`${prefix}pending`), so a prefix without a trailing separator yields
 		// "myapppending" — unreadable, and able to collide with a neighbouring
-		// prefix. Nothing warned, because nothing failed.
+		// prefix.
 		this.#prefix = withSeparator(options?.prefix ?? "queue:");
-		this.#allowNonAtomicPop = options?.allowNonAtomicPop ?? false;
 		const visibilityTimeout = options?.visibilityTimeoutMs ?? 30_000;
-		// A non-positive / non-integer timeout makes pop()'s `SET … PX <ms>` fail
-		// on a real Redis; the catch then removes the job from `processing` and
-		// returns null — the in-flight job is silently LOST. Fail closed at config
-		// time instead.
+		// `SET … PX <ms>` refuses anything but a positive integer, and a pop that
+		// cannot lease would take a job and drop it. Fail closed at config time.
 		if (!Number.isInteger(visibilityTimeout) || visibilityTimeout <= 0) {
 			throw new Error(
 				`[bay] RedisDriver visibilityTimeoutMs must be a positive integer (ms), got ${visibilityTimeout}`,
@@ -290,138 +384,239 @@ export class RedisDriver implements QueueDriver {
 	/**
 	 * Where one queue's jobs wait.
 	 *
-	 * The default queue keeps the key it always had. Naming it
-	 * `queue:default:pending` would have been tidier and would have orphaned
-	 * every job already sitting in `queue:pending` at the moment of the upgrade
-	 * — a silent loss, since nothing reads the old key afterwards.
+	 * The default queue keeps the key it always had: renaming it would orphan
+	 * every job already sitting in `queue:pending` at the moment of an upgrade.
 	 */
-	#pendingKey = (queue: string = DEFAULT_QUEUE) =>
-		queue === DEFAULT_QUEUE
+	#pendingKey(queue: string = DEFAULT_QUEUE): string {
+		return queue === DEFAULT_QUEUE
 			? `${this.#prefix}pending`
 			: `${this.#prefix}q:${queue}:pending`;
-	#delayedKey = (queue: string = DEFAULT_QUEUE) =>
-		queue === DEFAULT_QUEUE
+	}
+	#delayedKey(queue: string = DEFAULT_QUEUE): string {
+		return queue === DEFAULT_QUEUE
 			? `${this.#prefix}delayed`
 			: `${this.#prefix}q:${queue}:delayed`;
-	#processingKey = () => `${this.#prefix}processing`;
-	#allowNonAtomicPop = false;
-	#maxStalledCount = 1;
-	#maxFailedJobs = 1000;
-	/** This driver instance, as a lease owner. */
-	#workerId = crypto.randomUUID();
-	#failedKey = () => `${this.#prefix}failed`;
-	#leaseKey = (jobId: string) => `${this.#prefix}lease:${jobId}`;
+	}
+	#processingKey(): string {
+		return `${this.#prefix}processing`;
+	}
+	#failedKey(): string {
+		return `${this.#prefix}failed`;
+	}
+	#leaseKey(jobId: string): string {
+		return `${this.#prefix}lease:${jobId}`;
+	}
+
+	/** Run a script by digest, sending it in full only when the server lacks it. */
+	async #run(
+		client: RedisClient,
+		{ lua, sha }: Script,
+		keys: string[],
+		args: (string | number)[],
+	): Promise<unknown> {
+		if (client.evalsha) {
+			try {
+				return await client.evalsha(sha, keys.length, ...keys, ...args);
+			} catch (err) {
+				// Only "unknown script" falls through. Every other error may
+				// have come after the script ran, and running it twice is not
+				// safe.
+				if (!isNoScript(err)) throw err;
+			}
+		}
+		return client.eval(lua, keys.length, ...keys, ...args);
+	}
 
 	async push(job: JobRecord): Promise<void> {
 		const client = await this.#client();
+		const raw = JSON.stringify(job);
 		const queue = queueOf(job);
 		if (job.runAt !== undefined && job.runAt > Date.now()) {
-			if (!client.zadd) {
-				// Pushing it to the list instead would run it now, which is the
-				// one thing a delay exists to prevent.
-				throw new Error(
-					"This Redis client cannot hold a delayed job: it has no ZADD. " +
-						"Use a client with sorted-set commands (ioredis has them), or dispatch without `delay`.",
-				);
-			}
-			await client.zadd(
-				this.#delayedKey(queue),
-				job.runAt,
-				JSON.stringify(job),
-			);
+			await client.zadd(this.#delayedKey(queue), job.runAt, raw);
 			return;
 		}
-		await client.rpush(this.#pendingKey(queue), JSON.stringify(job));
+		await client.rpush(this.#pendingKey(queue), raw);
 	}
 
 	async pop(
 		queues: readonly string[] = [DEFAULT_QUEUE],
 	): Promise<JobRecord | null> {
+		if (queues.length === 0) return null;
 		const client = await this.#client();
-		let raw: string | null = null;
-
-		// In the order given, so a worker can say which queue it drains first.
+		const keys = [this.#processingKey()];
 		for (const queue of queues) {
-			await this.#promoteDue(client, queue);
-			raw = await this.#take(client, queue);
-			if (raw !== null) break;
+			keys.push(this.#pendingKey(queue), this.#delayedKey(queue));
 		}
-
-		if (!raw) return null;
-
-		// Only a payload that can never be run is purged. Everything past this
-		// point is a REAL job that already sits in `processing`, and deleting
-		// it there is the one thing that loses it for good: it is gone from
-		// pending too, and recoverStale() scans processing, so nothing would
-		// ever find it again.
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(raw);
-		} catch {
-			// A poison pill: unparseable, and it would sit in processing
-			// forever blocking nothing but wasting every recovery pass.
-			await client.lrem(this.#processingKey(), 1, raw);
-			return null;
+		// A record that cannot run is filed and the next one taken, so a run of
+		// bad entries does not cost a full idle delay each. Bounded, so a queue
+		// of nothing else still returns.
+		for (let tries = 0; tries < 100; tries++) {
+			const token = `${this.#workerId}:${randomUUID()}`;
+			const reply = readAcquired(
+				await this.#run(client, ACQUIRE, keys, [
+					Date.now(),
+					token,
+					this.#visibilityTimeout,
+					`${this.#prefix}lease:`,
+				]),
+			);
+			if (reply === null) return null;
+			const parsed = parseJob(reply.raw);
+			if (parsed.ok && reply.id !== undefined && parsed.job.id === reply.id) {
+				// A promoted job keeps the `runAt` it was delayed with; it is due.
+				parsed.job.runAt = undefined;
+				this.#claims.set(parsed.job, {
+					token,
+					raw: reply.raw,
+					id: reply.id,
+				});
+				return parsed.job;
+			}
+			const unreadable: Unreadable = parsed.ok
+				? { reason: "an id the queue could not read", id: parsed.job.id }
+				: parsed;
+			await this.#quarantine(
+				client,
+				reply.raw,
+				unreadable,
+				reply.id === undefined ? undefined : { token, id: reply.id },
+			);
 		}
-		if (!isValidJob(parsed)) {
-			await client.lrem(this.#processingKey(), 1, raw);
-			return null;
-		}
+		return null;
+	}
 
-		// A lease that cannot be written is a transient Redis failure, not a
-		// bad job. The error propagates and the job STAYS in processing with
-		// no lease, which is precisely the state recoverStale() puts back in
-		// pending — so the delivery guarantee survives the blip.
-		await client.set(
-			this.#leaseKey(parsed.id),
-			JSON.stringify({ owner: this.#workerId, raw } satisfies Lease),
-			"PX",
-			String(this.#visibilityTimeout),
+	/**
+	 * File an entry that can never run as failed, with what is wrong with it.
+	 *
+	 * Deleting it was silent data loss: a record written by a newer version, or
+	 * by hand, vanished with nothing to read about it anywhere.
+	 */
+	async #quarantine(
+		client: RedisClient,
+		raw: string,
+		unreadable: Unreadable,
+		held: { token: string; id: string } | undefined,
+	): Promise<void> {
+		const record = JSON.stringify(this.#deadLetter(raw, unreadable));
+		process.stderr.write(
+			`[bay] RedisDriver: filed an unreadable job record as failed (${unreadable.reason})\n`,
 		);
-		return parsed;
+		if (held) {
+			await this.#run(
+				client,
+				SETTLE,
+				[this.#leaseKey(held.id), this.#processingKey(), this.#failedKey()],
+				[held.token, raw, "failed", record, this.#maxFailedJobs],
+			);
+			return;
+		}
+		await this.#run(
+			client,
+			RECOVER,
+			[this.#processingKey(), this.#failedKey(), ""],
+			[raw, "failed", record, this.#maxFailedJobs],
+		);
+	}
+
+	#deadLetter(raw: string, unreadable: Unreadable): JobRecord {
+		return {
+			id: unreadable.id ?? digestId(raw),
+			name: unreadable.name ?? "(unreadable)",
+			payload: raw,
+			attempts: 0,
+			maxAttempts: 1,
+			status: "failed",
+			error: `Unreadable job record (${unreadable.reason}); the stored entry is the payload`,
+			createdAt: Date.now(),
+			queue: unreadable.queue ?? DEFAULT_QUEUE,
+		};
 	}
 
 	/**
 	 * Say the job is still being worked on, and push its deadline back.
 	 *
-	 * Answers `false` when there is nothing left to renew — the lease expired
-	 * and the job was recovered, or it was recovered and re-popped by another
-	 * worker, whose claim this one must not extend.
+	 * Answers `false` when this driver no longer holds the lease — it expired,
+	 * or the job was recovered and taken by another worker, whose claim this
+	 * one must not extend.
 	 */
 	async renew(job: JobRecord): Promise<boolean> {
+		const claim = this.#claims.get(job);
+		if (claim === undefined) return false;
 		const client = await this.#client();
-		const key = this.#leaseKey(job.id);
-		const stored = await client.get(key);
-		if (stored === null) return false;
-		const lease = readLease(stored);
-		if (lease.owner !== undefined && lease.owner !== this.#workerId) {
-			return false;
-		}
-		await client.set(key, stored, "PX", String(this.#visibilityTimeout));
-		return true;
+		const renewed = await this.#run(
+			client,
+			RENEW,
+			[this.#leaseKey(claim.id)],
+			[claim.token, this.#visibilityTimeout],
+		);
+		return renewed === 1;
 	}
 
 	async complete(job: JobRecord): Promise<void> {
-		const client = await this.#client();
-		await this.#removeFromProcessing(job);
-		await client.del(this.#leaseKey(job.id));
+		await this.#settle(job, "complete", this.#processingKey(), "", 0);
 	}
 
 	async fail(job: JobRecord, error: string): Promise<void> {
-		const client = await this.#client();
-		await this.#removeFromProcessing(job);
-		await client.del(this.#leaseKey(job.id));
 		job.error = error;
 		job.status = "failed";
-		await this.#pushFailed(client, job);
+		await this.#settle(
+			job,
+			"failed",
+			this.#failedKey(),
+			JSON.stringify(job),
+			this.#maxFailedJobs,
+		);
 	}
 
 	async retry(job: JobRecord): Promise<void> {
-		const client = await this.#client();
-		await this.#removeFromProcessing(job);
-		await client.del(this.#leaseKey(job.id));
 		job.status = "pending";
-		await client.rpush(this.#pendingKey(queueOf(job)), JSON.stringify(job));
+		const queue = queueOf(job);
+		if (job.runAt !== undefined && job.runAt > Date.now()) {
+			await this.#settle(
+				job,
+				"zset",
+				this.#delayedKey(queue),
+				JSON.stringify(job),
+				job.runAt,
+			);
+			return;
+		}
+		await this.#settle(
+			job,
+			"list",
+			this.#pendingKey(queue),
+			JSON.stringify(job),
+			0,
+		);
+	}
+
+	async #settle(
+		job: JobRecord,
+		mode: "complete" | "list" | "zset" | "failed",
+		destination: string,
+		entry: string,
+		extra: number,
+	): Promise<void> {
+		const claim = this.#claims.get(job);
+		if (claim === undefined) {
+			process.stderr.write(
+				`[bay] RedisDriver: job '${job.id}' was not taken by this worker; nothing to settle\n`,
+			);
+			return;
+		}
+		const client = await this.#client();
+		const settled = await this.#run(
+			client,
+			SETTLE,
+			[this.#leaseKey(claim.id), this.#processingKey(), destination],
+			[claim.token, claim.raw, mode, entry, extra],
+		);
+		this.#claims.delete(job);
+		if (settled !== 1) {
+			process.stderr.write(
+				`[bay] RedisDriver: job '${job.id}' lost its lease before it was settled; the worker that holds it now decides\n`,
+			);
+		}
 	}
 
 	async recoverStale(): Promise<number> {
@@ -429,123 +624,73 @@ export class RedisDriver implements QueueDriver {
 		const processing = await client.lrange(this.#processingKey(), 0, -1);
 		let recovered = 0;
 		for (const raw of processing) {
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(raw);
-			} catch {
-				// Malformed JSON would otherwise sit in processing forever —
-				// LREM purges it so the queue makes progress.
-				await client.lrem(this.#processingKey(), 1, raw);
+			const parsed = parseJob(raw);
+			if (!parsed.ok) {
+				// An entry the acquiring worker has not filed yet still carries
+				// its lease, and the script leaves it alone.
+				await this.#run(
+					client,
+					RECOVER,
+					[
+						this.#processingKey(),
+						this.#failedKey(),
+						parsed.id === undefined ? "" : this.#leaseKey(parsed.id),
+					],
+					[
+						raw,
+						"failed",
+						JSON.stringify(this.#deadLetter(raw, parsed)),
+						this.#maxFailedJobs,
+					],
+				);
 				continue;
 			}
-			if (!isValidJob(parsed)) {
-				await client.lrem(this.#processingKey(), 1, raw);
-				continue;
-			}
-			const lease = await client.get(this.#leaseKey(parsed.id));
-			if (lease !== null) continue;
-
-			// The LREM is the claim, and its RESULT decides who acts. Two
-			// recovery passes overlapping — two workers, or one worker whose
-			// pass ran long — both read the same expired entry, and both used to
-			// push it back to pending: one job, delivered twice, from the
-			// mechanism that exists to make delivery reliable. Exactly one LREM
-			// can remove a given element, so exactly one pass continues past
-			// here. (A crash between this and the RPUSH below still loses the
-			// entry; closing that needs the whole pass in one server-side script,
-			// which is how upstream does it.)
-			const claimed = await client.lrem(this.#processingKey(), 1, raw);
-			if (claimed === 0) continue;
-
+			const job = parsed.job;
 			// A stall is not an attempt: the worker died before the handler
 			// could fail, so `attempts` never moved and `maxAttempts` never
-			// applied. A job that kills whatever picks it up was therefore
-			// recovered forever, taking the queue with it. Counted separately,
-			// and bounded — upstream bounds the same thing with the same
-			// default, failing the job once it is exceeded.
-			const stalled = (parsed.stalledCount ?? 0) + 1;
-			if (stalled > this.#maxStalledCount) {
-				parsed.stalledCount = stalled;
-				parsed.status = "failed";
-				parsed.error = `Stalled ${stalled} time(s) without completing (maxStalledCount ${this.#maxStalledCount})`;
-				await this.#pushFailed(client, parsed);
-				continue;
+			// applied. Counted separately, and bounded — upstream bounds the
+			// same thing with the same default.
+			const stalled = (job.stalledCount ?? 0) + 1;
+			job.stalledCount = stalled;
+			job.runAt = undefined;
+			const exhausted = stalled > this.#maxStalledCount;
+			if (exhausted) {
+				job.status = "failed";
+				job.error = `Stalled ${stalled} time(s) without completing (maxStalledCount ${this.#maxStalledCount})`;
+			} else {
+				job.status = "pending";
 			}
-
-			parsed.stalledCount = stalled;
-			parsed.status = "pending";
-			// Back to the queue it came from, not to the default one: a recovered
-			// job whose queue nobody serves would never run again.
-			await client.rpush(
-				this.#pendingKey(queueOf(parsed)),
-				JSON.stringify(parsed),
+			const moved = await this.#run(
+				client,
+				RECOVER,
+				[
+					this.#processingKey(),
+					// Back to the queue it came from: a recovered job whose queue
+					// nobody serves would never run again.
+					exhausted ? this.#failedKey() : this.#pendingKey(queueOf(job)),
+					this.#leaseKey(job.id),
+				],
+				[
+					raw,
+					exhausted ? "failed" : "list",
+					JSON.stringify(job),
+					this.#maxFailedJobs,
+				],
 			);
-			recovered++;
+			if (moved === 1 && !exhausted) recovered++;
 		}
 		return recovered;
-	}
-
-	/**
-	 * File a job as failed, keeping the list to `maxFailedJobs`.
-	 *
-	 * Unbounded, the failed list is a leak with no ceiling and no owner: nothing
-	 * trims it, and `failed()` reads all of it in one LRANGE. The memory driver
-	 * has capped its own at a thousand from the start; this is the same cap on
-	 * the driver where the list actually survives a restart.
-	 */
-	async #pushFailed(client: RedisClient, job: JobRecord): Promise<void> {
-		await client.rpush(this.#failedKey(), JSON.stringify(job));
-		if (this.#maxFailedJobs === 0 || !client.ltrim) return;
-		await client.ltrim(this.#failedKey(), -this.#maxFailedJobs, -1);
-	}
-
-	/**
-	 * Remove the entry for `job` from the processing list. The string in
-	 * Redis is whatever pop() pushed, but QueueManager mutates `job` after
-	 * pop returns (attempts++, status="processing", processedAt, then
-	 * completed/failed/pending). LREM-ing on `JSON.stringify(job)` would
-	 * therefore miss every real-world entry. Use the lease — which carries
-	 * the exact raw string pop() moved — and fall back to a list scan when
-	 * the lease has expired (e.g. recoverStale already handled it).
-	 */
-	async #removeFromProcessing(job: JobRecord): Promise<void> {
-		const client = await this.#client();
-		const stored = await client.get(this.#leaseKey(job.id));
-		if (stored !== null) {
-			const { raw } = readLease(stored);
-			const removed = await client.lrem(this.#processingKey(), 1, raw);
-			if (removed > 0) return;
-		}
-		// Lease missing or already-LREM'd entry not found — best-effort scan
-		// matches by job id and removes the actual stored representation.
-		const items = await client.lrange(this.#processingKey(), 0, -1);
-		for (const item of items) {
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(item);
-			} catch {
-				continue;
-			}
-			if (isValidJob(parsed) && parsed.id === job.id) {
-				await client.lrem(this.#processingKey(), 1, item);
-				return;
-			}
-		}
 	}
 
 	async failed(): Promise<JobRecord[]> {
 		const client = await this.#client();
 		const raws = await client.lrange(this.#failedKey(), 0, -1);
-		return raws
-			.map((r) => {
-				try {
-					const parsed: unknown = JSON.parse(r);
-					return isValidJob(parsed) ? parsed : null;
-				} catch {
-					return null;
-				}
-			})
-			.filter((j): j is JobRecord => j !== null);
+		const jobs: JobRecord[] = [];
+		for (const raw of raws) {
+			const parsed = parseJob(raw);
+			if (parsed.ok) jobs.push(parsed.job);
+		}
+		return jobs;
 	}
 
 	/**
@@ -557,57 +702,7 @@ export class RedisDriver implements QueueDriver {
 	async size(queue: string = DEFAULT_QUEUE): Promise<number> {
 		const client = await this.#client();
 		const waiting = await client.llen(this.#pendingKey(queue));
-		const delayed = client.zcard
-			? await client.zcard(this.#delayedKey(queue))
-			: 0;
+		const delayed = await client.zcard(this.#delayedKey(queue));
 		return waiting + delayed;
-	}
-
-	/**
-	 * Move `queue`'s due jobs out of the delayed set and onto its list.
-	 *
-	 * `ZREM` is the claim: two workers can read the same due entry, and only
-	 * the one whose removal returns 1 owns it. Without that the job is pushed
-	 * onto the list once per worker that saw it.
-	 */
-	async #promoteDue(client: RedisClient, queue: string): Promise<void> {
-		if (!client.zrangebyscore || !client.zrem) return;
-		const due = await client.zrangebyscore(
-			this.#delayedKey(queue),
-			0,
-			Date.now(),
-			"LIMIT",
-			"0",
-			"100",
-		);
-		for (const raw of due) {
-			const claimed = await client.zrem(this.#delayedKey(queue), raw);
-			if (claimed !== 1) continue;
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(raw);
-			} catch {
-				// Already removed from the set; there is nothing runnable to push.
-				continue;
-			}
-			if (!isValidJob(parsed)) continue;
-			parsed.runAt = undefined;
-			await client.rpush(this.#pendingKey(queue), JSON.stringify(parsed));
-		}
-	}
-
-	/** Take the head of one queue, claiming it in `processing`. */
-	async #take(client: RedisClient, queue: string): Promise<string | null> {
-		if (client.lmove) {
-			return client.lmove(
-				this.#pendingKey(queue),
-				this.#processingKey(),
-				"LEFT",
-				"RIGHT",
-			);
-		}
-		const raw = await client.lpop(this.#pendingKey(queue));
-		if (raw) await client.rpush(this.#processingKey(), raw);
-		return raw;
 	}
 }

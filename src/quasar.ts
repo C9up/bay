@@ -12,18 +12,8 @@ import type { RedisClient } from "./drivers/RedisDriver.js";
 import { quasarConnection as loadQuasarConnection } from "./vendor/quasarConnection.js";
 
 // The commands this driver actually issues — every non-optional member of
-// `RedisClient`. `lmove` is deliberately absent: the driver declares it
-// optional and falls back when it is not there.
-const REQUIRED = [
-	"rpush",
-	"lpop",
-	"lrem",
-	"llen",
-	"lrange",
-	"del",
-	"set",
-	"get",
-] as const;
+// `RedisClient`. `evalsha` is optional: without it scripts are sent in full.
+const REQUIRED = ["eval", "rpush", "zadd", "llen", "zcard", "lrange"] as const;
 
 /**
  * A resolver — quasar is loaded on first use, not at config time.

@@ -2,57 +2,22 @@
  * `RedisDriver` against a REAL Redis, wired the way an app wires it: through
  * `quasarConnection()`.
  *
- * The unit suite drives a hand-written fake, which cannot reproduce what
- * actually matters here — LMOVE is atomic, so two workers popping the same
- * queue must never receive the same job. A fake happily lets both through and
- * the suite still passes.
+ * What matters here is that taking a job is one server-side step, so two
+ * workers popping the same queue must never receive the same job — something
+ * only a real server, with separate sockets per worker, can show.
  *
- * Gated on `REDIS_TEST_URL`; skipped without one.
+ * Gated on `REDIS_TEST_URL`; skipped without one (see `__helpers__/redis.ts`).
  */
-import { QuasarManager } from "@c9up/quasar";
-import { clearQuasar, setQuasar } from "@c9up/quasar/services/main";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, expect, it } from "vitest";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import type { JobRecord } from "../../src/QueueManager.js";
 import { quasarConnection } from "../../src/quasar.js";
-
-const url = process.env.REDIS_TEST_URL ?? "";
-
-/**
- * Skipped, not failed, when no server answers: a URL can be set and point at
- * nothing. Probed through quasar (a devDependency here) rather than ioredis,
- * which bay deliberately does not depend on.
- */
-async function serverAnswers(): Promise<boolean> {
-	const probe = new QuasarManager({
-		connection: "probe" as const,
-		// Fail fast instead of letting ioredis retry a dead port forever.
-		connections: {
-			probe: { url, lazyConnect: true, maxRetriesPerRequest: 1 },
-		},
-	});
-	try {
-		await probe.connection().ping();
-		return true;
-	} catch {
-		return false;
-	} finally {
-		// The one declared connection, by its literal name — `disconnect` is typed
-		// against the declared keys, so a plain string does not satisfy it.
-		await probe.disconnect("probe");
-	}
-}
-
-const live = url ? await serverAnswers() : false;
-
-const describeRedis = live ? describe : describe.skip;
-
-const WORKERS = 12;
-/** One declared connection per worker: separate sockets, or the pops serialise
- * and hide the very race these tests exist to catch. */
-const connections = Object.fromEntries(
-	Array.from({ length: WORKERS }, (_, i) => [`w${i}`, { url }]),
-);
+import {
+	describeRedis,
+	freshPrefix,
+	useRedis,
+	WORKERS,
+} from "../__helpers__/redis.js";
 
 function makeJob(id: string): JobRecord {
 	return {
@@ -67,8 +32,8 @@ function makeJob(id: string): JobRecord {
 }
 
 describeRedis("RedisDriver against a live Redis", () => {
-	const prefix = `bay-test:${process.pid}`;
-	const manager = new QuasarManager({ connection: "w0", connections });
+	const prefix = freshPrefix("integration");
+	const { manager } = useRedis();
 
 	function driver(worker: number): RedisDriver {
 		return new RedisDriver(quasarConnection(`w${worker}`), {
@@ -78,19 +43,9 @@ describeRedis("RedisDriver against a live Redis", () => {
 	}
 
 	beforeEach(async () => {
-		setQuasar(manager);
 		const client = manager.connection("w0");
 		const keys = await client.keys(`${prefix}*`);
 		if (keys.length > 0) await client.del(...keys);
-	});
-
-	afterAll(async () => {
-		// Closed one at a time rather than with quitAll(): CI resolves quasar from
-		// the registry, where the published version predates that method. quit(name)
-		// means the same in both.
-		const open = manager.activeConnectionNames;
-		for (const name of open) await manager.quit(name);
-		clearQuasar(manager);
 	});
 
 	it("hands a job to exactly ONE of many concurrent workers", async () => {
