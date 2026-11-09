@@ -47,6 +47,7 @@ export {
 	Job,
 	type JobClass,
 	type JobOptions,
+	jobNameOf,
 } from "./Job.js";
 export type {
 	Constructor,

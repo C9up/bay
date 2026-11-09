@@ -7,6 +7,7 @@ import {
 	Job,
 	type JobClass,
 	type JobOptions,
+	jobNameOf,
 	MAX_TIMEOUT,
 	toAttemptCount,
 	toMilliseconds,
@@ -219,7 +220,7 @@ export interface WorkerOptions {
  * took before job classes existed, kept because it is what every existing call
  * site passes. `maxRetries` is the class's name for the same number.
  */
-export interface DispatchOptions extends JobOptions {
+export interface DispatchOptions extends Omit<JobOptions, "name"> {
 	/** The older spelling of `maxRetries`. Wins when both are given. */
 	maxAttempts?: number;
 }
@@ -347,7 +348,25 @@ export class QueueManager {
 	 */
 	registerJob(job: JobClass): void {
 		checkJobOptions(job);
-		this.#jobs.set(job.name, job);
+		this.#claimName(job);
+	}
+
+	/**
+	 * Key `job` by its name, refusing a different class already under it.
+	 *
+	 * Overwriting was silent: two `SendEmail` classes in two directories, one
+	 * replaced the other, and a record dispatched for one ran the other's code.
+	 */
+	#claimName(job: JobClass): string {
+		const name = jobNameOf(job);
+		const existing = this.#jobs.get(name);
+		if (existing !== undefined && existing !== job) {
+			throw new Error(
+				`[bay] two job classes answer to '${name}'. Give one of them a static options.name so each has its own.`,
+			);
+		}
+		this.#jobs.set(name, job);
+		return name;
 	}
 
 	/** Every job class this manager knows, by name. */
@@ -388,10 +407,9 @@ export class QueueManager {
 		let declared: JobOptions = {};
 		if (isJobClass(job)) {
 			checkJobOptions(job);
-			name = job.name;
 			declared = job.options ?? {};
 			// So a worker that never dispatches still resolves it by name.
-			this.#jobs.set(name, job);
+			name = this.#claimName(job);
 		} else {
 			name = job;
 		}

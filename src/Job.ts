@@ -39,6 +39,15 @@ export type Duration = number | string;
  * queue, three attempts, no delay and no timeout.
  */
 export interface JobOptions {
+	/**
+	 * The name the job is queued and looked up under. Default: the class name.
+	 *
+	 * Set it when two classes share a class name — two `SendEmail` in
+	 * different directories — or when a bundler renames classes: the HTTP
+	 * process and the worker must agree on the name, and a minifier's `class t`
+	 * is not something they can agree on.
+	 */
+	name?: string;
 	/** Named queue this job waits in. Default `"default"`. */
 	queue?: string;
 	/**
@@ -115,6 +124,11 @@ export interface JobClass<Payload = unknown> {
 	readonly options?: JobOptions;
 }
 
+/** The name a job class is queued and looked up under — upstream's rule. */
+export function jobNameOf(job: JobClass): string {
+	return job.options?.name || job.name;
+}
+
 /** Is this a job class rather than a name or a handler instance? */
 export function isJobClass(value: unknown): value is JobClass {
 	return (
@@ -167,6 +181,12 @@ export function toTimeout(value: Duration | undefined): number | undefined {
 export function checkJobOptions(job: JobClass): void {
 	const options = job.options ?? {};
 	try {
+		if (
+			options.name !== undefined &&
+			(typeof options.name !== "string" || options.name.trim().length === 0)
+		) {
+			throw new Error("options.name must be a non-empty string");
+		}
 		const maxRetries = options.maxRetries ?? options.retry?.maxRetries;
 		if (maxRetries !== undefined) toAttemptCount(maxRetries, "maxRetries");
 		toTimeout(options.timeout);
