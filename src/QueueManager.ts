@@ -7,6 +7,7 @@ import {
 	type JobOptions,
 	toAttemptCount,
 	toMilliseconds,
+	toTimeout,
 } from "./Job.js";
 
 /**
@@ -337,9 +338,8 @@ export class QueueManager {
 			queue: options.queue ?? declared.queue ?? DEFAULT_QUEUE,
 		};
 		if (delayMs > 0) record.runAt = Date.now() + delayMs;
-		if (timeout !== undefined) {
-			record.timeout = toMilliseconds(timeout, "timeout");
-		}
+		const timeoutMs = toTimeout(timeout);
+		if (timeoutMs !== undefined) record.timeout = timeoutMs;
 		await this.#driver.push(record);
 		return id;
 	}

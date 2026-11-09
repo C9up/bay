@@ -127,6 +127,28 @@ export function toAttemptCount(value: number, label: string): number {
 	return value;
 }
 
+/** The longest delay `setTimeout` holds; past it Node fires after 1 ms. */
+export const MAX_TIMEOUT = 2_147_483_647;
+
+/**
+ * A job timeout in milliseconds, or `undefined` for none — upstream's
+ * `parseTimeout`: `0` means no timeout, anything else must be a whole number of
+ * milliseconds `setTimeout` can hold. A '30d' timeout used to reach
+ * `setTimeout` as-is, which Node clamps to 1 ms: the most generous timeout
+ * became the strictest, and every attempt failed at once.
+ */
+export function toTimeout(value: Duration | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const ms = toMilliseconds(value, "timeout");
+	if (ms === 0) return undefined;
+	if (!Number.isInteger(ms) || ms > MAX_TIMEOUT) {
+		throw new Error(
+			`timeout must be a whole number of milliseconds from 1 to ${MAX_TIMEOUT} (about 24.8 days), or 0 for none — got ${String(value)}`,
+		);
+	}
+	return ms;
+}
+
 /**
  * Check what a job class declares, so a class that cannot be run is refused at
  * registration — at boot — rather than on every dispatch.
@@ -137,6 +159,7 @@ export function checkJobOptions(job: JobClass): void {
 		if (options.maxRetries !== undefined) {
 			toAttemptCount(options.maxRetries, "maxRetries");
 		}
+		toTimeout(options.timeout);
 	} catch (err) {
 		throw new Error(
 			`[bay] job '${job.name}': ${err instanceof Error ? err.message : String(err)}`,

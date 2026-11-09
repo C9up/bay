@@ -57,3 +57,47 @@ describe("bay > maxAttempts / maxRetries", () => {
 		expect(await queue.failedJobs()).toHaveLength(1);
 	});
 });
+
+describe("bay > timeout", () => {
+	it("refuses a timeout setTimeout cannot hold, at dispatch and at registration", async () => {
+		class Month extends Job {
+			static override options = { timeout: "30d" };
+			async execute(): Promise<void> {}
+		}
+		const queue = new QueueManager(new MemoryDriver());
+		for (const bad of ["30d", 2_592_000_000, 1.5, "0.5ms"]) {
+			await expect(
+				queue.dispatch("x", {}, { timeout: bad }),
+				String(bad),
+			).rejects.toThrow(/timeout must be a whole number of milliseconds/);
+		}
+		expect(() => queue.registerJob(Month)).toThrow(/Month.*timeout/);
+		expect(await queue.size()).toBe(0);
+	});
+
+	it("still takes the longest one it can hold, and reads 0 as none", async () => {
+		const driver = new MemoryDriver();
+		const queue = new QueueManager(driver);
+		await queue.dispatch("x", {}, { timeout: "24d" });
+		await queue.dispatch("y", {}, { timeout: 0 });
+		const timeouts: (number | undefined)[] = [];
+		for (;;) {
+			const job = await driver.pop();
+			if (!job) break;
+			timeouts.push(job.timeout);
+		}
+		expect(timeouts).toEqual([24 * 86_400_000, undefined]);
+	});
+
+	it("does not fail a slow attempt at once when the timeout is long", async () => {
+		const queue = new QueueManager(new MemoryDriver());
+		queue.register("slow", {
+			async handle() {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			},
+		});
+		await queue.dispatch("slow", {}, { timeout: "24d", maxAttempts: 1 });
+		await queue.processOne();
+		expect(await queue.failedJobs()).toEqual([]);
+	});
+});
