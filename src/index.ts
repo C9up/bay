@@ -23,6 +23,16 @@ export type {
 	BayContainer,
 	BayProviderConfig,
 } from "./BayProvider.js";
+export {
+	type BackoffConfig,
+	type BackoffFactory,
+	BackoffStrategy,
+	customBackoff,
+	exponentialBackoff,
+	fixedBackoff,
+	linearBackoff,
+	type ResolvedBackoff,
+} from "./backoff.js";
 export { MemoryDriver } from "./drivers/MemoryDriver.js";
 export type {
 	RedisClient,

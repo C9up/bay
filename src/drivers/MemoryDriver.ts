@@ -78,9 +78,10 @@ export class MemoryDriver implements QueueDriver {
 		// Nothing to do for memory driver
 	}
 
+	/** Back in its queue, or with the delayed jobs when it carries a backoff. */
 	async retry(job: JobRecord): Promise<void> {
 		job.status = "pending";
-		this.#queue(queueOf(job)).push(job);
+		await this.push(job);
 	}
 
 	async failed(): Promise<JobRecord[]> {

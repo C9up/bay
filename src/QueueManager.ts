@@ -1,3 +1,4 @@
+import { type ResolvedBackoff, readBackoff } from "./backoff.js";
 import {
 	checkJobOptions,
 	DEFAULT_QUEUE,
@@ -52,6 +53,11 @@ export interface JobRecord {
 	runAt?: number;
 	/** Milliseconds the handler gets before the attempt counts as failed. */
 	timeout?: number;
+	/**
+	 * How long to wait before each retry, as data: a worker that never saw
+	 * the job class — or a job registered by name — still honours it.
+	 */
+	backoff?: ResolvedBackoff;
 }
 
 /** The queue a record belongs to, for a record written before named queues. */
@@ -366,7 +372,11 @@ export class QueueManager {
 			options.maxAttempts !== undefined
 				? toAttemptCount(options.maxAttempts, "maxAttempts")
 				: toAttemptCount(
-						options.maxRetries ?? declared.maxRetries ?? 3,
+						options.maxRetries ??
+							options.retry?.maxRetries ??
+							declared.maxRetries ??
+							declared.retry?.maxRetries ??
+							3,
 						"maxRetries",
 					);
 		const delay = options.delay ?? declared.delay;
@@ -387,6 +397,8 @@ export class QueueManager {
 		if (delayMs > 0) record.runAt = Date.now() + delayMs;
 		const timeoutMs = toTimeout(timeout);
 		if (timeoutMs !== undefined) record.timeout = timeoutMs;
+		const backoff = options.retry?.backoff ?? declared.retry?.backoff;
+		if (backoff !== undefined) record.backoff = backoff().getConfig();
 		await this.#driver.push(record);
 		return id;
 	}
@@ -446,6 +458,14 @@ export class QueueManager {
 			const errorMsg = error.message;
 			if (job.attempts < job.maxAttempts) {
 				job.status = "pending";
+				// Not straight back to the head of the line: a job failing
+				// because something it calls is down would spend every attempt
+				// within milliseconds. A driver parks a future `runAt` with its
+				// delayed jobs.
+				const backoff = readBackoff(job.backoff);
+				job.runAt = backoff
+					? Date.now() + backoff.calculateDelay(job.attempts)
+					: undefined;
 				await this.#driver.retry(job);
 			} else {
 				job.status = "failed";

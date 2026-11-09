@@ -27,6 +27,8 @@
  * runtime still needs.
  */
 
+import type { BackoffFactory } from "./backoff.js";
+
 /** Milliseconds, or a duration the way a config file writes one. */
 export type Duration = number | string;
 
@@ -47,6 +49,15 @@ export interface JobOptions {
 	maxRetries?: number;
 	/** Hold the job for this long before any worker may take it. */
 	delay?: Duration;
+	/**
+	 * Upstream's retry block. `backoff` spaces the attempts out —
+	 * `exponentialBackoff()`, `linearBackoff()`, `fixedBackoff()` — and
+	 * `maxRetries` here is the same count as the top-level one, which wins.
+	 */
+	retry?: {
+		maxRetries?: number;
+		backoff?: BackoffFactory;
+	};
 	/**
 	 * How long the handler gets. Past it the attempt is a failure and the job
 	 * retries or fails like any other, and `this.signal` is aborted.
@@ -156,10 +167,11 @@ export function toTimeout(value: Duration | undefined): number | undefined {
 export function checkJobOptions(job: JobClass): void {
 	const options = job.options ?? {};
 	try {
-		if (options.maxRetries !== undefined) {
-			toAttemptCount(options.maxRetries, "maxRetries");
-		}
+		const maxRetries = options.maxRetries ?? options.retry?.maxRetries;
+		if (maxRetries !== undefined) toAttemptCount(maxRetries, "maxRetries");
 		toTimeout(options.timeout);
+		// Built once here so a bad strategy fails at boot, not on the retry.
+		options.retry?.backoff?.();
 	} catch (err) {
 		throw new Error(
 			`[bay] job '${job.name}': ${err instanceof Error ? err.message : String(err)}`,

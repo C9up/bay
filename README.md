@@ -49,7 +49,7 @@ both names still resolve, so an existing `config/queue.ts` keeps working.
 
 ```ts
 // app/jobs/send_email.ts  —  ream make:job SendEmail
-import { Job } from '@c9up/bay'
+import { Job, exponentialBackoff } from '@c9up/bay'
 import type { JobOptions } from '@c9up/bay'
 
 export default class SendEmail extends Job<{ to: string }> {
@@ -58,6 +58,7 @@ export default class SendEmail extends Job<{ to: string }> {
     maxRetries: 5,     // how many times the handler may run
     delay: '10s',      // hold it before any worker may take it
     timeout: '1m',     // how long the handler gets
+    retry: { backoff: exponentialBackoff() },  // 1s, 2s, 4s… between attempts
   }
 
   async execute() {
