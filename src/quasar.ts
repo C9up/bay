@@ -9,21 +9,38 @@
  */
 
 import type { RedisClient } from "./drivers/RedisDriver.js";
-import { quasarConnection as loadQuasarConnection } from "./vendor/quasarConnection.js";
+import {
+	hasCommands,
+	quasarConnection as loadQuasarConnection,
+} from "./vendor/quasarConnection.js";
 
 // The commands this driver actually issues — every non-optional member of
 // `RedisClient`. `evalsha` is optional: without it scripts are sent in full.
 const REQUIRED = ["eval", "rpush", "zadd", "lrange"] as const;
 
 /**
+ * The connection is handed over only once it carries every command above.
+ * `evalsha` stays optional, but when there it has to be a function too.
+ */
+function isRedisClient(value: unknown): value is RedisClient {
+	return (
+		hasCommands(value, REQUIRED) &&
+		(!("evalsha" in value) ||
+			value.evalsha === undefined ||
+			typeof value.evalsha === "function")
+	);
+}
+
+/**
  * A resolver — quasar is loaded on first use, not at config time.
  */
 export function quasarConnection(name?: string): () => Promise<RedisClient> {
 	return async () =>
-		loadQuasarConnection<RedisClient>({
+		loadQuasarConnection({
 			pkg: "bay",
 			name,
 			required: REQUIRED,
+			isConnection: isRedisClient,
 			what: "the queue driver",
 			raise: (_reason, message, cause) => new Error(message, { cause }),
 		});
