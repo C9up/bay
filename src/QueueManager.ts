@@ -839,6 +839,12 @@ export class QueueManager {
 			if (pool.size >= concurrency) await Promise.race(pool);
 			else if (empty) await this.#sleep(idleDelay);
 		}
+		// A pop answered while `stop()` was waiting on it: that job is taken, and
+		// the loop is not over until it has run. Returning here let `stop()`
+		// resolve with the handler half-way through, and the process exit under
+		// it — lost in memory, re-delivered and run twice on Redis. Each attempt
+		// is bounded by its job's own `timeout`, which aborts its handler.
+		await Promise.allSettled(pool);
 	}
 
 	#report(err: unknown): void {
@@ -894,13 +900,15 @@ export class QueueManager {
 	 *
 	 * Awaits the LOOP, not just the job in flight: a stop that returns while
 	 * the loop is still sleeping leaves a worker running past the teardown that
-	 * asked it to stop.
+	 * asked it to stop. The loop first, then the drain: a pop still in flight
+	 * when `stop()` is called can answer a job, and that job only joins the
+	 * in-flight set after the call — draining first missed it.
 	 */
 	async stop(): Promise<void> {
 		this.#running = false;
 		this.#wake?.();
-		await this.drain();
 		if (this.#loopPromise) await this.#loopPromise.catch(() => {});
+		await this.drain();
 	}
 
 	/** Get failed jobs. */

@@ -347,6 +347,80 @@ describe("bay > stopping a worker whose job blew up", () => {
 		stderr.mockRestore();
 	});
 
+	it("waits for a job the pop in flight answers after stop() was called", async () => {
+		// The pop is held open, stop() is called while the loop awaits it, and
+		// only then does the pop answer a job: the job is taken, so it must run
+		// to completion before stop() returns rather than be left half-run.
+		let answerPop: ((job: JobRecord | null) => void) | undefined;
+		let popping: (() => void) | undefined;
+		const popStarted = new Promise<void>((resolve) => {
+			popping = resolve;
+		});
+		const completed: string[] = [];
+		let pops = 0;
+		const driver: QueueDriver = {
+			async push() {},
+			pop() {
+				pops++;
+				if (pops > 1) return Promise.resolve(null);
+				popping?.();
+				return new Promise((resolve) => {
+					answerPop = resolve;
+				});
+			},
+			async complete(job) {
+				completed.push(job.id);
+			},
+			async fail() {},
+			async retry() {},
+			async failed() {
+				return [];
+			},
+			async size() {
+				return 0;
+			},
+		};
+		let release: (() => void) | undefined;
+		let handlerDone = false;
+		const queue = new QueueManager(driver);
+		queue.register("slow", {
+			async handle() {
+				await new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				handlerDone = true;
+			},
+		});
+
+		const working = queue.work({ idleDelay: 5 });
+		await popStarted;
+		let stopped = false;
+		const stopping = queue.stop().then(() => {
+			stopped = true;
+		});
+		defined(answerPop)({
+			id: "taken",
+			name: "slow",
+			payload: null,
+			attempts: 0,
+			maxAttempts: 1,
+			status: "processing",
+			createdAt: Date.now(),
+		});
+		await vi.waitFor(() => expect(release).toBeDefined());
+		// Several turns of the event loop: a stop() that does not wait for the
+		// taken job resolves within them.
+		for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+		expect(stopped).toBe(false);
+		expect(handlerDone).toBe(false);
+
+		defined(release)();
+		await stopping;
+		await working;
+		expect(handlerDone).toBe(true);
+		expect(completed).toEqual(["taken"]);
+	});
+
 	it("is idempotent — stopping twice is not an error", async () => {
 		const queue = new QueueManager(new FailingDriver());
 		const stderr = vi
