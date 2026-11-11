@@ -104,8 +104,12 @@ export function makeJobCommand(options: MakeJobOptions): BayCommandClass {
 	return class MakeJob {
 		static commandName = "make:job";
 		static description = "Scaffold a background job class";
-		// Pure filesystem work: no reason to boot the app and open a connection.
-		static options = { startApp: false };
+		// NAMED DEVIATION: upstream's make:job does not boot and always writes
+		// to `app/jobs` under the app root, whatever `locations` says. Here the
+		// job lands in the first configured location, which only the
+		// provider's boot reads; without the boot the file went to ./app/jobs,
+		// where a worker configured elsewhere never looks.
+		static options = { startApp: true };
 		static args = [
 			argument("name", {
 				description: "Job class name, optionally under a subdirectory",

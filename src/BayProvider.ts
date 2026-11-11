@@ -267,11 +267,16 @@ export default class BayProvider {
 		this.#queue = await resolveQueue(this.app);
 		setQueue(this.#queue);
 
-		// `make:job` writes where discovery reads, so the two cannot drift. This
-		// half is pure bookkeeping and belongs with the rest of boot.
+		// `make:job` writes where discovery reads, so the two cannot drift: the
+		// same first location, resolved against the same root (`make:job` boots
+		// the app for this). This half is pure bookkeeping and belongs with the
+		// rest of boot.
 		const config = readConfig(this.app);
 		const first = (config?.locations ?? [DEFAULT_JOBS_DIR])[0];
-		if (first !== undefined) setJobsDir(directoryOf(first));
+		if (first !== undefined) {
+			const dir = directoryOf(first);
+			setJobsDir(this.app.makePath ? this.app.makePath(dir) : dir);
+		}
 	}
 
 	/**

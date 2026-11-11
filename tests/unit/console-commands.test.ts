@@ -10,6 +10,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import BayProvider, { type BayAppContext } from "../../src/BayProvider.js";
 import { argument, flag } from "../../src/console/contract.js";
 import { getCommand, getMetaData } from "../../src/console/index.js";
 import {
@@ -20,6 +21,7 @@ import {
 import { parseQueues, queueWorkCommand } from "../../src/console/queueWork.js";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import {
+	DEFAULT_JOBS_DIR,
 	directoryOf,
 	discoverJobs,
 	getJobsDir,
@@ -195,6 +197,57 @@ describe("bay > make:job", () => {
 		expect(error.mock.calls.flat().join(" ")).toContain("Invalid job name");
 		process.exitCode = 0;
 		error.mockRestore();
+	});
+
+	it("writes where discovery reads: the configured location, under the app root", async () => {
+		// The kernel boots the application only for a command declaring
+		// `startApp`, and the provider's boot is what reads `locations`; with
+		// `startApp: false` the file always went to ./app/jobs.
+		const root = await fixture("make-job-root");
+		const bindings = new Map<unknown, () => unknown>();
+		const context: BayAppContext = {
+			container: {
+				singleton(token: unknown, factory: () => unknown) {
+					bindings.set(token, factory);
+				},
+				async resolve(token: unknown): Promise<unknown> {
+					const factory = bindings.get(token);
+					if (factory === undefined) throw new Error("unbound token");
+					return factory();
+				},
+			},
+			config: { get: () => ({ locations: ["./src/jobs/**/*.ts"] }) },
+			makePath: (...segments) => path.join(root, ...segments),
+		};
+		const provider = new BayProvider(context);
+		provider.register();
+		try {
+			const [meta] = (await getMetaData()).filter(
+				(entry) => entry.commandName === "make:job",
+			);
+			expect(meta?.options).toMatchObject({ startApp: true });
+			// What the kernel does for `startApp: true`, before `run()`.
+			await provider.boot();
+			const MakeJob = meta === undefined ? null : await getCommand(meta);
+			if (MakeJob === null) throw new Error("expected make:job");
+			const command = new MakeJob();
+			Object.assign(command, { name: "SendMail" });
+			vi.spyOn(console, "log").mockImplementation(() => {});
+
+			// `cwd` is a different directory than the app root.
+			await command.run();
+
+			await expect(
+				fsp.readFile(path.join(root, "src/jobs/send_mail.ts"), "utf8"),
+			).resolves.toContain("export default class SendMail");
+			await expect(
+				fsp.access(path.join(dir, "app/jobs/send_mail.ts")),
+			).rejects.toThrow();
+		} finally {
+			await provider.shutdown();
+			setJobsDir(DEFAULT_JOBS_DIR);
+			await fsp.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("derives the class and the file from what was asked for", () => {
