@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { JobRecord } from "../../src/QueueManager.js";
+import { type JobRecord, QueueManager } from "../../src/QueueManager.js";
 import { FakeQueue } from "../../src/testing/FakeQueue.js";
 
 /** Narrow away null/undefined without a `!` assertion (which lies to the compiler). */
@@ -245,5 +245,73 @@ describe("FakeQueue — assertNotPushed", () => {
 				payloadMatches: (p) => Reflect.get(Object(p), "userId") === 1,
 			}),
 		).toThrow(/at least one captured job matches/);
+	});
+});
+
+describe("FakeQueue — agrees with the real drivers", () => {
+	it("queues one job for two dispatches under the same dedup id", async () => {
+		const fake = new FakeQueue();
+		const queue = new QueueManager(fake);
+		const first = await queue.dispatch(
+			"mail",
+			{ n: 1 },
+			{ dedup: { id: "x" } },
+		);
+		const second = await queue.dispatch(
+			"mail",
+			{ n: 2 },
+			{ dedup: { id: "x" } },
+		);
+
+		// Both real drivers answer the holder's id and queue nothing new.
+		expect(second).toBe(first);
+		expect(fake.getPushed()).toHaveLength(1);
+		expect(() =>
+			fake.assertNotPushed("mail", {
+				payloadMatches: (payload) =>
+					typeof payload === "object" &&
+					payload !== null &&
+					Reflect.get(payload, "n") === 2,
+			}),
+		).not.toThrow();
+	});
+
+	it("frees the dedup id once the holder completes", async () => {
+		const fake = new FakeQueue();
+		const queue = new QueueManager(fake);
+		const first = await queue.dispatch("mail", {}, { dedup: { id: "x" } });
+		const held = defined(fake.getPushed()[0]);
+		await fake.complete(held);
+		const second = await queue.dispatch("mail", {}, { dedup: { id: "x" } });
+
+		expect(second).not.toBe(first);
+		expect(fake.getPushed()).toHaveLength(2);
+	});
+
+	it("captures the payload as dispatched, not as later mutated", async () => {
+		const fake = new FakeQueue();
+		const queue = new QueueManager(fake);
+		const payload = { a: 1 };
+		await queue.dispatch("mail", payload);
+		payload.a = 2;
+
+		expect(defined(fake.getPushed()[0]).payload).toEqual({ a: 1 });
+		const nested = defined(fake.getPushed()[0]).payload;
+		if (typeof nested === "object" && nested !== null) {
+			Reflect.set(nested, "a", 3);
+		}
+		expect(defined(fake.getPushed()[0]).payload).toEqual({ a: 1 });
+	});
+
+	it("keeps the runAt a retry carries, so a backoff can be observed", async () => {
+		const fake = new FakeQueue();
+		const job = makeJob({ id: "r" });
+		await fake.push(job);
+		const later = Date.now() + 60_000;
+		await fake.retry({ ...job, attempts: 1, runAt: later });
+
+		const captured = defined(fake.getPushed()[0]);
+		expect(captured.runAt).toBe(later);
+		expect(captured.attempts).toBe(1);
 	});
 });

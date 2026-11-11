@@ -11,6 +11,7 @@
 
 import { DEFAULT_QUEUE } from "../Job.js";
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
+import { snapshot } from "../record.js";
 
 export interface FakeQueuePredicate {
 	/** Custom payload predicate — receives the job's `payload` and
@@ -28,8 +29,17 @@ export type FakeQueuePredicateArg =
 
 export class FakeQueue implements QueueDriver {
 	#pushed: JobRecord[] = [];
+	/** Dedup id → the id of the job holding it, as the memory driver keeps it. */
+	#dedup: Map<string, { jobId: string; expiresAt: number | undefined }> =
+		new Map();
 
-	async push(job: JobRecord): Promise<void> {
+	/**
+	 * Captured as a JSON copy and deduplicated, the way both real drivers
+	 * store a job. By reference, a payload changed after dispatch changed the
+	 * captured job, and two dispatches under one dedup id captured two jobs:
+	 * `assertPushed` passed on behaviour production does not have.
+	 */
+	async push(job: JobRecord): Promise<string | undefined> {
 		// Reject duplicate ids to surface the most common test-fixture
 		// mistake — two `makeJob({ id: 'x' })` reused across pushes
 		// silently corrupts later `fail`/`complete`/`retry` lookups.
@@ -38,7 +48,31 @@ export class FakeQueue implements QueueDriver {
 				`FakeQueue: duplicate job id '${job.id}' — each push must use a unique id (the real drivers enforce this implicitly via crypto.randomUUID()).`,
 			);
 		}
-		this.#pushed.push(job);
+		const dedup = job.dedup;
+		if (dedup !== undefined) {
+			const now = Date.now();
+			const held = this.#dedup.get(dedup.id);
+			if (held && (held.expiresAt === undefined || held.expiresAt > now)) {
+				if (dedup.extend && dedup.ttl !== undefined) {
+					held.expiresAt = now + dedup.ttl;
+				}
+				return held.jobId;
+			}
+			this.#dedup.set(dedup.id, {
+				jobId: job.id,
+				expiresAt: dedup.ttl === undefined ? undefined : now + dedup.ttl,
+			});
+		}
+		this.#pushed.push(snapshot(job));
+		return undefined;
+	}
+
+	/** Let the next job with this dedup id be captured. */
+	#release(job: JobRecord): void {
+		const id = job.dedup?.id;
+		if (id !== undefined && this.#dedup.get(id)?.jobId === job.id) {
+			this.#dedup.delete(id);
+		}
 	}
 
 	/** Always returns `null` — fake queues never auto-dispatch.
@@ -58,12 +92,14 @@ export class FakeQueue implements QueueDriver {
 		const found = this.#requireJob(job, "fail");
 		found.status = "failed";
 		found.error = error;
+		this.#release(found);
 	}
 
 	async complete(job: JobRecord): Promise<void> {
 		const found = this.#requireJob(job, "complete");
 		found.status = "completed";
 		found.processedAt = Date.now();
+		this.#release(found);
 	}
 
 	async retry(job: JobRecord): Promise<void> {
@@ -72,7 +108,11 @@ export class FakeQueue implements QueueDriver {
 		// increments it before it calls this, and neither real driver touches it
 		// again. Incrementing here counted the same attempt twice, so a fake
 		// exhausted `maxAttempts` in half the tries the real queue takes — a
-		// test double that disagrees with what it stands in for.
+		// test double that disagrees with what it stands in for. The capture
+		// is a copy now, so the worker's count is taken from the record it
+		// hands back, as a real driver stores it.
+		found.attempts = job.attempts;
+		found.unknownCount = job.unknownCount;
 		found.status = "pending";
 		// Reset transient state from the prior failure so a retried
 		// job's invariants match a fresh push (a real driver would
@@ -80,6 +120,9 @@ export class FakeQueue implements QueueDriver {
 		// them — we mirror "drop").
 		found.error = undefined;
 		found.processedAt = undefined;
+		// The backoff the worker computed: a real driver parks the job until
+		// then, and a test reads it here.
+		found.runAt = job.runAt;
 	}
 
 	/** Look up the captured copy of a job by id. Throws when the id
@@ -97,9 +140,7 @@ export class FakeQueue implements QueueDriver {
 	}
 
 	async failed(): Promise<JobRecord[]> {
-		return this.#pushed
-			.filter((j) => j.status === "failed")
-			.map((j) => ({ ...j }));
+		return this.#pushed.filter((j) => j.status === "failed").map(snapshot);
 	}
 
 	/** Pending jobs on the default queue, like the real drivers. */
@@ -115,16 +156,17 @@ export class FakeQueue implements QueueDriver {
 	}
 
 	/**
-	 * Defensive snapshot of every captured job. Each entry is a
-	 * shallow clone so test-side mutations can't bleed back into the
-	 * internal capture store — avoids cross-test contamination.
+	 * Defensive snapshot of every captured job. Each entry is a deep
+	 * copy so test-side mutations, payload included, can't bleed back
+	 * into the internal capture store — avoids cross-test contamination.
 	 */
 	getPushed(): JobRecord[] {
-		return this.#pushed.map((j) => ({ ...j }));
+		return this.#pushed.map(snapshot);
 	}
 
 	reset(): void {
 		this.#pushed = [];
+		this.#dedup.clear();
 	}
 
 	assertPushed(name: string, predicate?: FakeQueuePredicateArg): void {
