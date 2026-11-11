@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
+import { Job } from "../../src/Job.js";
 import { QueueManager } from "../../src/QueueManager.js";
 
 describe("bay > MemoryDriver serialises like Redis", () => {
@@ -38,6 +39,42 @@ describe("bay > MemoryDriver serialises like Redis", () => {
 		await queue.processOne();
 
 		expect(seen).toEqual([{ at: "1970-01-01T00:00:00.000Z" }]);
+	});
+
+	it("hands a payload's own `__proto__` key over as data, polluting nothing", async () => {
+		// What a JSON body or another service's record can carry: an OWN key
+		// named `__proto__`. Copied with a spread or `Object.assign` on the way
+		// through, it would become a prototype instead of a field.
+		const hostile: unknown = JSON.parse('{"__proto__":{"admin":true},"n":1}');
+		const seen: unknown[] = [];
+		class Inspect extends Job<unknown> {
+			async execute(): Promise<void> {
+				seen.push(this.payload);
+			}
+		}
+		const queue = new QueueManager(new MemoryDriver());
+		queue.register("handler", {
+			async handle(payload) {
+				seen.push(payload);
+			},
+		});
+		await queue.dispatch("handler", hostile);
+		await queue.dispatch(Inspect, hostile);
+
+		await queue.processOne();
+		await queue.processOne();
+
+		expect(seen).toHaveLength(2);
+		for (const payload of seen) {
+			if (typeof payload !== "object" || payload === null) {
+				throw new Error("expected an object payload");
+			}
+			expect(Object.hasOwn(payload, "__proto__")).toBe(true);
+			expect(Object.getPrototypeOf(payload)).toBe(Object.prototype);
+			expect(Reflect.get(payload, "admin")).toBeUndefined();
+		}
+		expect(Reflect.get({}, "admin")).toBeUndefined();
+		expect(Object.hasOwn(Object.prototype, "admin")).toBe(false);
 	});
 
 	it("refuses at dispatch what Redis could not store", async () => {

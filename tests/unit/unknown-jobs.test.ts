@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
+import { Job } from "../../src/Job.js";
 import { QueueManager } from "../../src/QueueManager.js";
 
 const UNKNOWN_JOB_RETRY_DELAY = 30_000;
@@ -73,6 +74,30 @@ describe("bay > a job the worker does not know yet", () => {
 		expect(failed.map((job) => [job.attempts, job.error])).toEqual([
 			[0, "No handler registered for job: gone"],
 		]);
+	});
+
+	it("takes a record named after an Object.prototype member for an unknown job", async () => {
+		// A shared store (Redis written by another service) can hold any name.
+		// Looked up on a plain object, `constructor` answered `Object` and
+		// `__proto__` answered `Object.prototype`: a handler that does not
+		// exist, run and failed, spending the job's attempts.
+		class Known extends Job<Record<string, never>> {
+			async execute(): Promise<void> {}
+		}
+		const queue = new QueueManager(new MemoryDriver());
+		queue.registerJob(Known);
+		queue.register("handled", { async handle() {} });
+		for (const name of ["constructor", "__proto__", "toString"]) {
+			await queue.dispatch(name, {}, { maxAttempts: 1 });
+			expect(await queue.processOne()).toBe(true);
+			expect(stderr).toHaveBeenCalledWith(
+				expect.stringContaining(`no handler registered for job '${name}' yet`),
+			);
+		}
+
+		// Put back, attempts untouched, nothing failed.
+		expect(await queue.failedJobs()).toEqual([]);
+		expect(await queue.size()).toBe(3);
 	});
 
 	it("refuses an unknownJobRetries that is not a count", async () => {
