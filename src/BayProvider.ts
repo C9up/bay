@@ -164,6 +164,24 @@ async function resolveQueue(app: BayAppContext): Promise<QueueManager> {
  * an application that meant to queue in Redis and silently got an in-process
  * queue would only find out when a restart dropped every pending job.
  */
+const DRIVER_METHODS = [
+	"push",
+	"pop",
+	"complete",
+	"fail",
+	"retry",
+	"failed",
+	"size",
+] as const;
+
+/** Whether `value` carries every method the manager calls on a driver. */
+function isQueueDriver(value: unknown): value is QueueDriver {
+	if (typeof value !== "object" || value === null) return false;
+	return DRIVER_METHODS.every(
+		(method) => typeof Reflect.get(value, method) === "function",
+	);
+}
+
 function buildDriver(config: BayProviderConfig | undefined): QueueDriver {
 	// `adapters` first, `stores` when it is absent: the key was renamed to the
 	// one upstream reads, and a config that still says `stores` must keep
@@ -173,8 +191,11 @@ function buildDriver(config: BayProviderConfig | undefined): QueueDriver {
 	const name = config?.default;
 
 	if (adapters && name !== undefined) {
-		const selected = adapters[name];
-		if (!selected) {
+		// An own key only: `adapters` is a plain object, and a name read through
+		// its prototype chain (`constructor`, `toString`) answered a function
+		// that built no driver, so the error surfaced at the first dispatch.
+		const selected = Object.hasOwn(adapters, name) ? adapters[name] : undefined;
+		if (typeof selected !== "function") {
 			const known = Object.keys(adapters);
 			throw new Error(
 				`[bay] config.queue names the adapter '${name}', which is not in \`${key}\`. ` +
@@ -183,7 +204,13 @@ function buildDriver(config: BayProviderConfig | undefined): QueueDriver {
 						: `\`${key}\` is empty — declare one with drivers.memory() or drivers.redis().`),
 			);
 		}
-		return selected();
+		const driver: unknown = selected();
+		if (!isQueueDriver(driver)) {
+			throw new Error(
+				`[bay] the adapter '${name}' did not build a queue driver — an adapter factory answers an object with push(), pop(), complete(), fail(), retry(), failed() and size().`,
+			);
+		}
+		return driver;
 	}
 
 	if (adapters && name === undefined) {

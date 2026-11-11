@@ -74,6 +74,30 @@ describe("bay > store selection", () => {
 		).toThrow(/not in `stores`.*Declared: memory/s);
 	});
 
+	it("refuses a `default` that only names something on Object.prototype", () => {
+		// `QUEUE_DRIVER=constructor` read `Object` off the prototype chain and
+		// booted a driver without methods; `hasOwnProperty` threw a TypeError
+		// unrelated to the config. Each is an adapter the config never declared.
+		for (const name of [
+			"constructor",
+			"toString",
+			"hasOwnProperty",
+			"__proto__",
+		]) {
+			expect(() =>
+				managerFrom({ default: name, adapters: { memory: drivers.memory() } }),
+			).toThrow(
+				new RegExp(`names the adapter '${name}', which is not in \`adapters\``),
+			);
+		}
+	});
+
+	it("refuses an adapter factory that does not build a driver", () => {
+		expect(() =>
+			managerFrom({ default: "broken", adapters: { broken: () => ({}) } }),
+		).toThrow(/adapter 'broken' did not build a queue driver/);
+	});
+
 	it("refuses `stores` with no `default`", () => {
 		expect(() => managerFrom({ stores: { memory: stores.memory() } })).toThrow(
 			/no `default`/,
