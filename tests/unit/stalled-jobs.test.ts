@@ -2,7 +2,7 @@
  * What happens when a lease runs out — against a real Redis, whose expiry is
  * the thing under test.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { type JobRecord, QueueManager } from "../../src/QueueManager.js";
 import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
@@ -99,24 +99,53 @@ describeRedis("bay > stalled jobs", () => {
 	});
 
 	describe("a handler slower than its lease", () => {
+		// The heartbeat is a `setInterval`, so only that is faked: the beat is
+		// stepped by hand, and the lease is brought near its deadline with
+		// PEXPIRE instead of being waited out. The client's own timers stay
+		// real, so the round trips to the server still happen.
+		beforeEach(() => {
+			vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+		});
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
 		it("keeps the job instead of handing it to the next worker", async () => {
 			const { first, second, prefix } = await drivers("slow", {
-				visibilityTimeoutMs: 200,
+				visibilityTimeoutMs: 10_000,
 			});
 			const queue = new QueueManager(first);
 			let runs = 0;
+			let started: (() => void) | undefined;
+			const running = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			let release: (() => void) | undefined;
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
 			queue.register("work", {
 				async handle() {
 					runs++;
-					// Three times the lease — the shape of a report, an upload.
-					await new Promise((resolve) => setTimeout(resolve, 600));
+					started?.();
+					// Held past its lease — the shape of a report, an upload.
+					await held;
 				},
 			});
 
-			await queue.dispatch("work", {});
+			const id = await queue.dispatch("work", {});
 			const processing = queue.processOne();
-			await new Promise((resolve) => setTimeout(resolve, 400));
+			await running;
+			const lease = `${prefix}lease:${id}`;
+			// Two seconds left: without a heartbeat it ends there.
+			await connection().pexpire(lease, 2_000);
+
+			await vi.advanceTimersByTimeAsync(first.renewIntervalMs);
+			await vi.waitFor(async () =>
+				expect(await connection().pttl(lease)).toBeGreaterThan(5_000),
+			);
 			const reclaimed = await second.recoverStale();
+			release?.();
 			await processing;
 
 			expect(runs).toBe(1);
@@ -134,8 +163,11 @@ describeRedis("bay > stalled jobs", () => {
 
 			await queue.dispatch("work", {});
 			await queue.processOne();
-			await new Promise((resolve) => setTimeout(resolve, 350));
 
+			// No heartbeat left behind, and stepping past several beats writes
+			// no lease back.
+			expect(vi.getTimerCount()).toBe(0);
+			await vi.advanceTimersByTimeAsync(first.renewIntervalMs * 3);
 			expect(await connection().keys(`${prefix}*`)).toEqual([]);
 		});
 	});

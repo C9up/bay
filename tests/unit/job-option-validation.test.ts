@@ -3,7 +3,7 @@
  * dispatch, or when the class is registered — never discovered later as a job
  * that runs forever or silently vanishes.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { Job } from "../../src/Job.js";
 import { QueueManager } from "../../src/QueueManager.js";
@@ -90,14 +90,23 @@ describe("bay > timeout", () => {
 	});
 
 	it("does not fail a slow attempt at once when the timeout is long", async () => {
-		const queue = new QueueManager(new MemoryDriver());
-		queue.register("slow", {
-			async handle() {
-				await new Promise((resolve) => setTimeout(resolve, 20));
-			},
-		});
-		await queue.dispatch("slow", {}, { timeout: "24d", maxAttempts: 1 });
-		await queue.processOne();
-		expect(await queue.failedJobs()).toEqual([]);
+		// Both the handler's 20 ms and the 24 d timeout run on the fake clock:
+		// a timeout clamped to 1 ms fires first when the clock moves.
+		vi.useFakeTimers();
+		try {
+			const queue = new QueueManager(new MemoryDriver());
+			queue.register("slow", {
+				async handle() {
+					await new Promise((resolve) => setTimeout(resolve, 20));
+				},
+			});
+			await queue.dispatch("slow", {}, { timeout: "24d", maxAttempts: 1 });
+			const processing = queue.processOne();
+			await vi.advanceTimersByTimeAsync(20);
+			await processing;
+			expect(await queue.failedJobs()).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

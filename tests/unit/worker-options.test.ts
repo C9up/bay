@@ -49,14 +49,20 @@ describe("bay > work() options", () => {
 	it("takes durations the way a config file writes them", async () => {
 		const queue = new QueueManager(new MemoryDriver());
 		let ran = 0;
+		let done: (() => void) | undefined;
+		const handled = new Promise<void>((resolve) => {
+			done = resolve;
+		});
 		queue.register("x", {
 			async handle() {
 				ran++;
+				done?.();
 			},
 		});
 		await queue.dispatch("x", {});
 		const working = queue.work({ idleDelay: "10ms", stalledInterval: "30s" });
-		await new Promise((resolve) => setTimeout(resolve, 30));
+		// The job running is the signal, not a guess at how long it takes.
+		await handled;
 		await queue.stop();
 		await working;
 		expect(ran).toBe(1);

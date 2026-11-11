@@ -185,16 +185,25 @@ describe("bay > named queues", () => {
 
 describe("bay > a delayed job", () => {
 	it("is not handed out before its time", async () => {
-		const driver = new MemoryDriver();
-		const queue = new QueueManager(driver);
+		// The delay is read off `Date.now()`, so the clock is moved rather
+		// than waited out.
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			const driver = new MemoryDriver();
+			const queue = new QueueManager(driver);
 
-		await queue.dispatch("later", {}, { delay: 50 });
-		expect(await driver.pop()).toBeNull();
-		// Still queued, though — anything draining before shutdown must see it.
-		expect(await driver.size()).toBe(1);
+			await queue.dispatch("later", {}, { delay: 50 });
+			expect(await driver.pop()).toBeNull();
+			// Still queued, though — anything draining before shutdown must see it.
+			expect(await driver.size()).toBe(1);
 
-		await new Promise((resolve) => setTimeout(resolve, 60));
-		expect((await driver.pop())?.name).toBe("later");
+			vi.setSystemTime(Date.now() + 49);
+			expect(await driver.pop()).toBeNull();
+			vi.setSystemTime(Date.now() + 1);
+			expect((await driver.pop())?.name).toBe("later");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("reads a duration the way a config file writes one", () => {
