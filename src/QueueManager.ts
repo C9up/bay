@@ -560,6 +560,8 @@ export class QueueManager {
 		let execution: Promise<void> | undefined;
 		let runner: JobRunner | undefined;
 		let handled = false;
+		/** A retry/fail write that rejected, reported once the slot is free. */
+		let writeError: { error: unknown } | undefined;
 		try {
 			// Built inside the attempt: a factory that throws — a dependency the
 			// container cannot resolve — is this attempt failing, not the
@@ -581,11 +583,22 @@ export class QueueManager {
 				job.runAt = backoff
 					? Date.now() + backoff.calculateDelay(job.attempts)
 					: undefined;
-				await this.#driver.retry(job);
+				try {
+					await this.#driver.retry(job);
+				} catch (retryErr) {
+					writeError = { error: retryErr };
+				}
 			} else {
 				job.status = "failed";
 				job.error = errorMsg;
-				await this.#driver.fail(job, errorMsg);
+				// A write that rejects (a Redis blip) is held, not thrown: thrown
+				// here it skipped both the hook below and the wait for an aborted
+				// handler, and the slot was freed while that handler still ran.
+				try {
+					await this.#driver.fail(job, errorMsg);
+				} catch (failErr) {
+					writeError = { error: failErr };
+				}
 				// After the last attempt, not after each one. A throw here is
 				// reported and swallowed: the job has already failed, and
 				// failing to say so must not be read as a second failure.
@@ -601,7 +614,16 @@ export class QueueManager {
 			}
 		} finally {
 			stopRenewing();
+			// A timed-out attempt is settled, but its handler may still be
+			// running. Returning now would free this worker's slot while it does,
+			// and the retry could start beside it: concurrency 1 was measured
+			// running four attempts of one job at once. Upstream waits for it the
+			// same way. In the `finally`, so nothing thrown above skips it.
+			if (controller.signal.aborted && execution !== undefined) {
+				await execution.catch(() => {});
+			}
 		}
+		if (writeError !== undefined) throw writeError.error;
 
 		// Outside the catch, and deliberately. Marking the job done is a write to
 		// the driver, and a write can fail on its own — a Redis blip, a closed
@@ -614,14 +636,6 @@ export class QueueManager {
 		if (handled) {
 			job.status = "completed";
 			await this.#driver.complete(job);
-		}
-
-		// A timed-out attempt is settled, but its handler may still be running.
-		// Returning now would free this worker's slot while it does, and the
-		// retry could start beside it: concurrency 1 was measured running four
-		// attempts of one job at once. Upstream waits for it the same way.
-		if (controller.signal.aborted && execution !== undefined) {
-			await execution.catch(() => {});
 		}
 	}
 

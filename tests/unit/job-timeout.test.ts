@@ -2,7 +2,7 @@
  * A timed-out attempt is told it timed out, and keeps its worker slot until it
  * actually returns — so `concurrency` stays a bound on what really runs.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { Job } from "../../src/Job.js";
 import { QueueManager } from "../../src/QueueManager.js";
@@ -89,4 +89,72 @@ describe("bay > a timed-out handler", () => {
 		expect(finished).toBe(true);
 		expect(await queue.failedJobs()).toHaveLength(1);
 	});
+});
+
+describe("bay > a driver write that fails after a timeout", () => {
+	/** A memory driver whose `method` rejects the first time it is called. */
+	function flakyDriver(method: "retry" | "fail"): MemoryDriver {
+		const driver = new MemoryDriver();
+		let thrown = false;
+		const original = driver[method].bind(driver);
+		Object.defineProperty(driver, method, {
+			value: async (...args: Parameters<MemoryDriver["fail"]>) => {
+				if (!thrown) {
+					thrown = true;
+					throw new Error("redis went away");
+				}
+				return original(...args);
+			},
+		});
+		return driver;
+	}
+
+	for (const method of ["retry", "fail"] as const) {
+		it(`holds the slot until the aborted handler returns when ${method}() rejects`, async () => {
+			const queue = new QueueManager(flakyDriver(method));
+			let release: (() => void) | undefined;
+			let aborted = false;
+			let failedHook = 0;
+			class Stubborn extends Job<Record<string, never>> {
+				static override options = {
+					timeout: 5,
+					maxRetries: method === "retry" ? 2 : 1,
+				};
+				async execute(): Promise<void> {
+					// Ignores its signal, the case the abort wait exists for.
+					this.signal.addEventListener("abort", () => {
+						aborted = true;
+					});
+					await new Promise<void>((resolve) => {
+						release = resolve;
+					});
+				}
+				override async failed(): Promise<void> {
+					failedHook++;
+				}
+			}
+			await queue.dispatch(Stubborn, {});
+
+			let settled = false;
+			const processing = queue.processOne().then(
+				() => {
+					settled = true;
+				},
+				(err: unknown) => {
+					settled = true;
+					throw err;
+				},
+			);
+			await vi.waitFor(() => expect(aborted).toBe(true));
+			for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+			// The handler is still running, so the slot is still taken.
+			expect(settled).toBe(false);
+
+			if (release === undefined) throw new Error("expected the handler");
+			release();
+			// The write's failure is still reported, after the wait.
+			await expect(processing).rejects.toThrow(/redis went away/);
+			expect(failedHook).toBe(method === "fail" ? 1 : 0);
+		});
+	}
 });
