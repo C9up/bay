@@ -28,6 +28,7 @@
  */
 
 import type { BackoffFactory } from "./backoff.js";
+import { JobBatchDispatcher, JobDispatcher } from "./JobDispatcher.js";
 
 /** Milliseconds, or a duration the way a config file writes one. */
 export type Duration = number | string;
@@ -81,6 +82,87 @@ export interface JobOptions {
 	 * keeps its worker slot, so `concurrency` stays a bound on what runs.
 	 */
 	timeout?: Duration;
+	/**
+	 * Fail the job at once when an attempt times out, instead of retrying it.
+	 * Default `false`: a timeout is a failed attempt like any other.
+	 */
+	failOnTimeout?: boolean;
+	/**
+	 * What happens to the job once it completed — upstream's `JobRetention`.
+	 * `true` (the default) removes it at once, `false` keeps it, `{ age, count }`
+	 * keeps it and prunes the completed jobs of its whole QUEUE, whatever their
+	 * class, by age and/or count. What it keeps is what `queue.getJob(id)` can
+	 * still answer.
+	 */
+	removeOnComplete?: JobRetention;
+	/**
+	 * The same for a job that finally failed. It governs `getJob` only: the
+	 * failed list (`failedJobs()`, bounded by `maxFailedJobs`) keeps its own.
+	 */
+	removeOnFail?: JobRetention;
+}
+
+/**
+ * How long a finished job is kept — upstream's `JobRetention`: `true` removes
+ * it at once, `false` keeps it, `{ age, count }` keeps the newest `count` and
+ * those younger than `age`.
+ */
+export type JobRetention = boolean | { age?: Duration; count?: number };
+
+/** A retention as a record carries it: only present when the job is kept. */
+export interface ResolvedRetention {
+	/** Milliseconds; `0` for no age bound. */
+	maxAge: number;
+	/** `0` for no count bound. */
+	maxCount: number;
+}
+
+/**
+ * Check a retention and resolve it for the record, or `undefined` for "remove
+ * at once" — upstream's `resolveRetention`.
+ */
+export function toRetention(
+	value: JobRetention | undefined,
+	label: string,
+): ResolvedRetention | undefined {
+	if (value === undefined || value === true) return undefined;
+	if (value === false) return { maxAge: 0, maxCount: 0 };
+	if (typeof value !== "object" || value === null) {
+		throw new Error(`${label} must be a boolean or { age?, count? }`);
+	}
+	const maxAge =
+		value.age === undefined ? 0 : toMilliseconds(value.age, `${label}.age`);
+	const maxCount = value.count ?? 0;
+	if (!Number.isSafeInteger(maxCount) || maxCount < 0) {
+		throw new Error(
+			`${label}.count must be a whole number >= 0, got ${String(value.count)}`,
+		);
+	}
+	if (!Number.isSafeInteger(maxAge)) {
+		throw new Error(`${label}.age must be a whole number of milliseconds`);
+	}
+	return { maxAge, maxCount };
+}
+
+/**
+ * What a job knows about the attempt it is running — upstream's
+ * `JobContext`, frozen. `scheduleId` is not carried: recurring jobs are the
+ * scheduler's (the README's recorded deviation), not the queue's.
+ */
+export interface JobContext {
+	/** The id `dispatch` answered. */
+	readonly jobId: string;
+	/** The name the job is queued under. */
+	readonly name: string;
+	/** 1 on the first run, 2 on the first retry. */
+	readonly attempt: number;
+	readonly queue: string;
+	/** 1 to 10, lower runs first. */
+	readonly priority: number;
+	/** When this worker took the job. */
+	readonly acquiredAt: Date;
+	/** How many times the job was recovered from a worker that died. */
+	readonly stalledCount: number;
 }
 
 /** The queue a job goes to when nothing names one. */
@@ -106,6 +188,41 @@ export abstract class Job<Payload = unknown> {
 	 * steps: the worker slot stays taken until `execute()` returns.
 	 */
 	declare readonly signal: AbortSignal;
+
+	/**
+	 * The attempt this run is: job id, attempt number (1-based), queue,
+	 * priority, when it was taken — upstream's `this.context`. A job that must
+	 * not repeat a side effect reads `attempt`; a log line reads `jobId`.
+	 */
+	declare readonly context: JobContext;
+
+	/**
+	 * Queue this job through the bound queue (`services/main`), fluently —
+	 * upstream's `Job.dispatch`:
+	 *
+	 *     const { jobId } = await SendEmail.dispatch({ to }).toQueue('emails')
+	 *
+	 * Awaiting it is what sends it; `.run()` does the same explicitly.
+	 */
+	static dispatch<Payload>(
+		this: JobClass<Payload>,
+		payload: Payload,
+	): JobDispatcher<Payload> {
+		// biome-ignore lint/complexity/noThisInStatic: `this` is the subclass being dispatched; the suggested `Job` would queue the abstract base.
+		return new JobDispatcher(this, payload);
+	}
+
+	/**
+	 * Queue one job per payload — upstream's `Job.dispatchMany`. Answers every
+	 * id, in the order of the payloads.
+	 */
+	static dispatchMany<Payload>(
+		this: JobClass<Payload>,
+		payloads: readonly Payload[],
+	): JobBatchDispatcher<Payload> {
+		// biome-ignore lint/complexity/noThisInStatic: `this` is the subclass being dispatched; the suggested `Job` would queue the abstract base.
+		return new JobBatchDispatcher(this, payloads);
+	}
 
 	/** Do the work. Throwing is what makes the attempt fail. */
 	abstract execute(): Promise<void> | void;
@@ -209,6 +326,8 @@ export function checkJobOptions(job: JobClass): void {
 		const maxRetries = options.maxRetries ?? options.retry?.maxRetries;
 		if (maxRetries !== undefined) toAttemptCount(maxRetries, "maxRetries");
 		toTimeout(options.timeout);
+		toRetention(options.removeOnComplete, "removeOnComplete");
+		toRetention(options.removeOnFail, "removeOnFail");
 		// Built once here so a bad strategy fails at boot, not on the retry.
 		options.retry?.backoff?.();
 	} catch (err) {

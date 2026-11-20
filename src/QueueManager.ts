@@ -1,17 +1,21 @@
 import { type ResolvedBackoff, readBackoff } from "./backoff.js";
 import {
 	checkJobOptions,
+	DEFAULT_PRIORITY,
 	DEFAULT_QUEUE,
 	type Duration,
 	isJobClass,
 	Job,
 	type JobClass,
+	type JobContext,
 	type JobOptions,
 	jobNameOf,
 	MAX_TIMEOUT,
+	type ResolvedRetention,
 	toAttemptCount,
 	toMilliseconds,
 	toPriority,
+	toRetention,
 	toTimeout,
 } from "./Job.js";
 
@@ -73,6 +77,36 @@ export interface JobRecord {
 	 * the job class — or a job registered by name — still honours it.
 	 */
 	backoff?: ResolvedBackoff;
+	/** A timed-out attempt fails the job at once (`failOnTimeout`). */
+	failOnTimeout?: true;
+	/**
+	 * Kept after it completed, and how long (`removeOnComplete`). Absent: removed
+	 * at once, upstream's default.
+	 */
+	removeOnComplete?: ResolvedRetention;
+	/** Kept after it finally failed, and how long (`removeOnFail`). */
+	removeOnFail?: ResolvedRetention;
+}
+
+/** Where a job is — upstream's `JobStatus`. */
+export type JobStatus =
+	| "pending"
+	| "active"
+	| "delayed"
+	| "completed"
+	| "failed";
+
+/**
+ * What `getJob` answers — upstream's adapter `JobRecord`: where the job is, the
+ * record as last stored, and for a finished one when it finished and why it
+ * failed.
+ */
+export interface JobLookup {
+	status: JobStatus;
+	data: JobRecord;
+	/** Epoch ms, for a completed or failed job. */
+	finishedAt?: number;
+	error?: string;
 }
 
 /** The queue a record belongs to, for a record written before named queues. */
@@ -86,7 +120,11 @@ export interface JobHandler {
 	 * stop a running promise from outside, so a handler that wants to stop on
 	 * time listens to it — and the worker slot stays taken until it returns.
 	 */
-	handle(payload: unknown, signal: AbortSignal): Promise<void>;
+	handle(
+		payload: unknown,
+		signal: AbortSignal,
+		context?: JobContext,
+	): Promise<void>;
 }
 
 /**
@@ -97,8 +135,20 @@ export interface JobHandler {
  * shapes.
  */
 interface JobRunner {
-	run(payload: unknown, signal: AbortSignal): Promise<void> | void;
+	run(
+		payload: unknown,
+		signal: AbortSignal,
+		context: JobContext,
+	): Promise<void> | void;
 	onFailed?(error: Error): Promise<void> | void;
+}
+
+/** An attempt that ran out of its `timeout` — what `failOnTimeout` looks for. */
+export class JobTimeoutError extends Error {
+	constructor(name: string, ms: number) {
+		super(`Job '${name}' exceeded its ${ms}ms timeout`);
+		this.name = "JobTimeoutError";
+	}
 }
 
 /**
@@ -117,7 +167,7 @@ function withTimeout(
 	if (ms === undefined || ms <= 0) return work;
 	return new Promise<void>((resolve, reject) => {
 		const timer = setTimeout(() => {
-			const error = new Error(`Job '${name}' exceeded its ${ms}ms timeout`);
+			const error = new JobTimeoutError(name, ms);
 			controller.abort(error);
 			reject(error);
 		}, ms);
@@ -192,6 +242,22 @@ function toUnknownJobRetries(value: number | undefined): number {
 		);
 	}
 	return value;
+}
+
+/**
+ * The context of the attempt about to run — upstream's `JobContext`, frozen
+ * so a handler cannot rewrite what the next reader sees.
+ */
+function contextOf(job: JobRecord): JobContext {
+	return Object.freeze({
+		jobId: job.id,
+		name: job.name,
+		attempt: job.attempts,
+		queue: queueOf(job),
+		priority: job.priority ?? DEFAULT_PRIORITY,
+		acquiredAt: new Date(job.processedAt ?? Date.now()),
+		stalledCount: job.stalledCount ?? 0,
+	});
 }
 
 /** A queue list that serves something, each name non-empty. */
@@ -296,6 +362,12 @@ export interface QueueDriver {
 	 * default queue only.
 	 */
 	sizeOf?(queue: string): Promise<number>;
+	/**
+	 * Where the job with this id is, or `null` once it is gone (completed or
+	 * failed and not kept by its retention). Optional for a driver written
+	 * before lookups; `QueueManager.getJob` then refuses.
+	 */
+	getJob?(jobId: string): Promise<JobLookup | null>;
 	/**
 	 * Optional crash recovery: move jobs orphaned in the driver's 'processing'
 	 * state (expired visibility lease) back to pending, returning the count
@@ -452,6 +524,71 @@ export class QueueManager {
 		payload: unknown,
 		options: DispatchOptions = {},
 	): Promise<string> {
+		const record = this.#record(job, payload, options);
+		// A driver honouring dedup answers the id that holds the place.
+		const holder = await this.#driver.push(record);
+		return typeof holder === "string" ? holder : record.id;
+	}
+
+	/**
+	 * Queue one job per payload — upstream's `dispatchMany`. Every record is
+	 * built (and checked) before the first is pushed, so a bad option queues
+	 * none of them; the pushes themselves are one per job.
+	 */
+	async dispatchMany<Payload>(
+		job: JobClass<Payload>,
+		payloads: readonly Payload[],
+		options?: DispatchOptions,
+	): Promise<string[]>;
+	async dispatchMany(
+		name: string,
+		payloads: readonly unknown[],
+		options?: DispatchOptions,
+	): Promise<string[]>;
+	async dispatchMany(
+		job: string | JobClass,
+		payloads: readonly unknown[],
+		options: DispatchOptions = {},
+	): Promise<string[]> {
+		const records = payloads.map((payload) =>
+			this.#record(job, payload, options),
+		);
+		const ids: string[] = [];
+		for (const record of records) {
+			const holder = await this.#driver.push(record);
+			ids.push(typeof holder === "string" ? holder : record.id);
+		}
+		return ids;
+	}
+
+	/**
+	 * Where a dispatched job is — upstream's `getJob`: `pending`, `delayed`,
+	 * `active`, `completed` or `failed`, with the record as last stored; `null`
+	 * once it is gone. A completed or failed job is only kept when its
+	 * `removeOnComplete` / `removeOnFail` says so: by default, as upstream, it
+	 * is removed at once.
+	 *
+	 * `queue`, when given, must be the job's: a job id names one job whichever
+	 * queue it is in, so the argument only narrows.
+	 */
+	async getJob(jobId: string, queue?: string): Promise<JobLookup | null> {
+		if (!this.#driver.getJob) {
+			throw new Error(
+				"This queue driver has no getJob(), so it cannot look a job up",
+			);
+		}
+		const found = await this.#driver.getJob(jobId);
+		if (found === null) return null;
+		if (queue !== undefined && queueOf(found.data) !== queue) return null;
+		return found;
+	}
+
+	/** Build and check the record `dispatch` pushes. */
+	#record(
+		job: string | JobClass,
+		payload: unknown,
+		options: DispatchOptions,
+	): JobRecord {
 		let name: string;
 		let declared: JobOptions = {};
 		if (isJobClass(job)) {
@@ -502,9 +639,20 @@ export class QueueManager {
 		if (options.dedup !== undefined) {
 			record.dedup = toDedup(name, options.dedup);
 		}
-		// A driver honouring dedup answers the id that holds the place.
-		const holder = await this.#driver.push(record);
-		return typeof holder === "string" ? holder : id;
+		if ((options.failOnTimeout ?? declared.failOnTimeout) === true) {
+			record.failOnTimeout = true;
+		}
+		const onComplete = toRetention(
+			options.removeOnComplete ?? declared.removeOnComplete,
+			"removeOnComplete",
+		);
+		if (onComplete !== undefined) record.removeOnComplete = onComplete;
+		const onFail = toRetention(
+			options.removeOnFail ?? declared.removeOnFail,
+			"removeOnFail",
+		);
+		if (onFail !== undefined) record.removeOnFail = onFail;
+		return record;
 	}
 
 	/**
@@ -567,13 +715,19 @@ export class QueueManager {
 			// container cannot resolve — is this attempt failing, not the
 			// worker.
 			runner = await this.#build(target);
-			execution = Promise.resolve(runner.run(job.payload, controller.signal));
+			execution = Promise.resolve(
+				runner.run(job.payload, controller.signal, contextOf(job)),
+			);
 			await withTimeout(execution, job.timeout, job.name, controller);
 			handled = true;
 		} catch (err) {
 			const error = err instanceof Error ? err : new Error(String(err));
 			const errorMsg = error.message;
-			if (job.attempts < job.maxAttempts) {
+			// `failOnTimeout`: a timed-out attempt is the last one.
+			const final =
+				job.attempts >= job.maxAttempts ||
+				(job.failOnTimeout === true && error instanceof JobTimeoutError);
+			if (!final) {
 				job.status = "pending";
 				// Not straight back to the head of the line: a job failing
 				// because something it calls is down would spend every attempt
@@ -665,7 +819,10 @@ export class QueueManager {
 					"The job factory built something without a handle() method for a registered handler class",
 				);
 			}
-			return { run: (payload, signal) => handler.handle(payload, signal) };
+			return {
+				run: (payload, signal, context) =>
+					handler.handle(payload, signal, context),
+			};
 		}
 		const JobConstructor = target.job;
 		const instance = await this.#jobFactory(JobConstructor);
@@ -675,7 +832,7 @@ export class QueueManager {
 			);
 		}
 		return {
-			run: (payload, signal) => {
+			run: (payload, signal, context) => {
 				// `payload` and `signal` are declared readonly on the class so a
 				// handler cannot rewrite them; they are assigned once, here.
 				Object.defineProperty(instance, "payload", {
@@ -685,6 +842,10 @@ export class QueueManager {
 				});
 				Object.defineProperty(instance, "signal", {
 					value: signal,
+					configurable: true,
+				});
+				Object.defineProperty(instance, "context", {
+					value: context,
 					configurable: true,
 				});
 				return instance.execute();

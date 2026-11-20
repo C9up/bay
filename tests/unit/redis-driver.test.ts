@@ -270,10 +270,11 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 		await driver.pop();
 		await driver.pop();
 
-		// At most one full send (another test file may load the same script
-		// first), always after a digest attempt, and the digest afterwards.
+		// At most one full send per script — two here, the push and the
+		// acquire (another test file may load them first) — always after a
+		// digest attempt, and the digest afterwards.
 		const scripted = calls.filter((c) => c === "eval" || c === "evalsha");
-		expect(scripted.filter((c) => c === "eval").length).toBeLessThanOrEqual(1);
+		expect(scripted.filter((c) => c === "eval").length).toBeLessThanOrEqual(2);
 		expect(scripted[0]).toBe("evalsha");
 		expect(scripted.at(-1)).toBe("evalsha");
 	});

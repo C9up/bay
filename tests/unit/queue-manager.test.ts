@@ -109,6 +109,7 @@ describe("bay > QueueManager > processOne", () => {
 		expect(handler.handle).toHaveBeenCalledWith(
 			{ id: 42 },
 			expect.any(AbortSignal),
+			expect.objectContaining({ attempt: 1, name: "email" }),
 		);
 		expect(driver.completed).toHaveLength(1);
 		expect(driver.completed[0]?.status).toBe("completed");

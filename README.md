@@ -105,6 +105,55 @@ queue.register('send-email', new SendEmailHandler())
 await queue.dispatch('send-email', { to: 'user@example.com' })
 ```
 
+### What a running job knows
+
+`this.context` is the attempt: `jobId`, `name`, `attempt` (1 on the first run),
+`queue`, `priority`, `acquiredAt` and `stalledCount`, frozen. A handler
+registered by name receives it as the third argument of `handle(payload,
+signal, context)`.
+
+```ts
+async execute() {
+  if (this.context.attempt > 1) logger.info(`retrying ${this.context.jobId}`)
+}
+```
+
+### Dispatching from the class
+
+```ts
+const { jobId } = await SendEmail.dispatch({ to }).toQueue('emails').in('5m').priority(1)
+const { jobIds } = await SendEmail.dispatchMany([{ to: a }, { to: b }]).toQueue('emails')
+```
+
+Both go through the queue bound to `services/main`; awaiting the builder sends
+it. `dedup({ id, ttl?, extend? })` is on the single dispatcher. Upstream's
+`group()` and `with(adapter)` are not offered: bay has no job groups, and one
+queue drives one store. `dispatchMany` checks every payload's options before
+pushing the first, then pushes one job at a time (not one atomic batch).
+
+### Asking what became of a job
+
+```ts
+const found = await queue.getJob(jobId)
+// { status: 'pending' | 'delayed' | 'active' | 'completed' | 'failed', data, finishedAt?, error? } | null
+```
+
+A finished job is removed at once unless its retention keeps it:
+`removeOnComplete` / `removeOnFail` take `true` (the default), `false` (keep it)
+or `{ age, count }`, which prunes the completed (or failed) jobs of the whole
+queue by age and count. `removeOnFail` governs `getJob` only; `failedJobs()`
+keeps its own list, bounded by `maxFailedJobs`. `failOnTimeout: true` fails a
+job whose attempt timed out instead of retrying it.
+
+### Not offered: a SQL-backed queue
+
+bay stores jobs in memory or in Redis. Upstream's `knex_adapter` /
+`kysely_adapter` (and the `queue:migrate` command) have no bay counterpart: an
+application without Redis runs the memory store on one process. NAMED
+DEVIATION — a SQL store is a third implementation of every lease, retry and
+recovery move bay makes atomically in Redis scripts, and is its own piece of
+work rather than part of this one.
+
 ## Priorities, unique jobs, recurring jobs
 
 ```ts

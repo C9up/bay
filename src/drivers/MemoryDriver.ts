@@ -2,8 +2,14 @@
  * Memory queue driver — in-process queue for development and tests.
  */
 
+import type { ResolvedRetention } from "../Job.js";
 import { DEFAULT_PRIORITY, DEFAULT_QUEUE } from "../Job.js";
-import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
+import {
+	type JobLookup,
+	type JobRecord,
+	type QueueDriver,
+	queueOf,
+} from "../QueueManager.js";
 import { snapshot } from "../record.js";
 
 function priorityOf(job: JobRecord | undefined): number {
@@ -25,6 +31,17 @@ export class MemoryDriver implements QueueDriver {
 	#maxFailedJobs: number;
 	/** Dedup id → the job holding it, and until when (epoch ms) if it expires. */
 	#dedup: Map<string, { jobId: string; expiresAt?: number }> = new Map();
+	/**
+	 * Every job `getJob` can answer: those waiting or running, and the finished
+	 * ones their retention keeps.
+	 */
+	#lookup: Map<string, JobLookup> = new Map();
+	/**
+	 * Finished job ids kept by a retention, oldest first, per status and queue
+	 * — the set a `count` or an `age` prunes, as upstream prunes a queue's
+	 * history whatever the job class.
+	 */
+	#history: Map<string, string[]> = new Map();
 
 	constructor(options?: { maxFailedJobs?: number }) {
 		this.#maxFailedJobs = options?.maxFailedJobs ?? 1000;
@@ -78,6 +95,7 @@ export class MemoryDriver implements QueueDriver {
 
 	#store(job: JobRecord): void {
 		const stored = snapshot(job);
+		this.#lookup.set(stored.id, { status: "pending", data: stored });
 		if (stored.runAt !== undefined && stored.runAt > Date.now()) {
 			this.#delayed.push(stored);
 			this.#delayed.sort((a, b) => (a.runAt ?? 0) - (b.runAt ?? 0));
@@ -110,7 +128,10 @@ export class MemoryDriver implements QueueDriver {
 				if (priorityOf(jobs[index]) < priorityOf(jobs[best])) best = index;
 			}
 			const [next] = jobs.splice(best, 1);
-			if (next !== undefined) return next;
+			if (next !== undefined) {
+				this.#lookup.set(next.id, { status: "active", data: next });
+				return next;
+			}
 		}
 		return null;
 	}
@@ -123,10 +144,68 @@ export class MemoryDriver implements QueueDriver {
 		if (this.#failedJobs.length > this.#maxFailedJobs) {
 			this.#failedJobs.splice(0, this.#failedJobs.length - this.#maxFailedJobs);
 		}
+		this.#finish(job, "failed", job.removeOnFail, error);
 	}
 
 	async complete(job: JobRecord): Promise<void> {
 		this.#release(job);
+		this.#finish(job, "completed", job.removeOnComplete);
+	}
+
+	/**
+	 * Forget a finished job, or keep it for `getJob` and prune its queue's
+	 * history by the retention's age and count — upstream's `#storeHistory`.
+	 */
+	#finish(
+		job: JobRecord,
+		status: "completed" | "failed",
+		retention: ResolvedRetention | undefined,
+		error?: string,
+	): void {
+		if (retention === undefined) {
+			this.#lookup.delete(job.id);
+			return;
+		}
+		const now = Date.now();
+		this.#lookup.set(job.id, {
+			status,
+			data: snapshot(job),
+			finishedAt: now,
+			...(error === undefined ? {} : { error }),
+		});
+		const key = `${status}:${queueOf(job)}`;
+		const ids = this.#history.get(key) ?? [];
+		ids.push(job.id);
+		this.#history.set(key, ids);
+		const prune = (id: string | undefined): void => {
+			if (id !== undefined) this.#lookup.delete(id);
+		};
+		if (retention.maxAge > 0) {
+			const cutoff = now - retention.maxAge;
+			while (ids.length > 0) {
+				const oldest = this.#lookup.get(ids[0] ?? "");
+				if (oldest !== undefined && (oldest.finishedAt ?? 0) >= cutoff) break;
+				prune(ids.shift());
+			}
+		}
+		if (retention.maxCount > 0) {
+			while (ids.length > retention.maxCount) prune(ids.shift());
+		}
+	}
+
+	async getJob(jobId: string): Promise<JobLookup | null> {
+		const found = this.#lookup.get(jobId);
+		if (found === undefined) return null;
+		const data = snapshot(found.data);
+		// Promoted lazily on a pop: a waiting job whose delay is not over is
+		// delayed, whichever list it sits in.
+		const status =
+			found.status === "pending" &&
+			data.runAt !== undefined &&
+			data.runAt > Date.now()
+				? "delayed"
+				: found.status;
+		return { ...found, status, data };
 	}
 
 	/**

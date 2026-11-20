@@ -47,21 +47,35 @@ export {
 	isJobClass,
 	Job,
 	type JobClass,
+	type JobContext,
 	type JobOptions,
+	type JobRetention,
 	jobNameOf,
 } from "./Job.js";
+export {
+	type DispatchManyResult,
+	type DispatchResult,
+	JobBatchDispatcher,
+	JobDispatcher,
+} from "./JobDispatcher.js";
 export type {
 	Constructor,
 	DispatchOptions,
 	HandlerRegistration,
 	JobFactory,
 	JobHandler,
+	JobLookup,
 	JobRecord,
+	JobStatus,
 	QueueDriver,
 	QueueManagerOptions,
 	WorkerOptions,
 } from "./QueueManager.js";
-export { QueueManager, queueOf } from "./QueueManager.js";
+export {
+	JobTimeoutError,
+	QueueManager,
+	queueOf,
+} from "./QueueManager.js";
 
 import type { BayProviderConfig } from "./BayProvider.js";
 
