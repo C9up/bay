@@ -74,6 +74,64 @@ describe("bay > RedisDriver > config validation", () => {
 	});
 });
 
+/**
+ * Quasar retires a connection whose socket ended for good (its retry strategy
+ * gave up) and hands out a fresh one on the next `connection(name)`. A driver
+ * that kept the first one failed every operation with "Connection is closed."
+ * until the process restarted, even once Redis was back.
+ */
+describe("bay > RedisDriver > a connection that ended for good", () => {
+	function fakeClient(status: string) {
+		return {
+			status,
+			eval: vi.fn(async () => 0),
+			rpush: vi.fn(async () => 1),
+			zadd: vi.fn(async () => 1),
+			lrange: vi.fn(async (): Promise<string[]> => []),
+		};
+	}
+
+	it("asks its resolver again once the client it holds has ended", async () => {
+		const first = fakeClient("ready");
+		const second = fakeClient("ready");
+		const resolver = vi
+			.fn<() => RedisClient>()
+			.mockReturnValueOnce(first)
+			.mockReturnValueOnce(second);
+		const driver = new RedisDriver(resolver);
+
+		await driver.size();
+		first.status = "end";
+		await driver.size();
+		await driver.size();
+
+		expect(resolver).toHaveBeenCalledTimes(2);
+		expect(first.eval).toHaveBeenCalledOnce();
+		expect(second.eval).toHaveBeenCalledTimes(2);
+	});
+
+	it("keeps a client that closed but reconnects by itself", async () => {
+		const client = fakeClient("ready");
+		const resolver = vi.fn(() => client);
+		const driver = new RedisDriver(resolver);
+
+		await driver.size();
+		client.status = "close";
+		await driver.size();
+
+		expect(resolver).toHaveBeenCalledOnce();
+	});
+
+	it("keeps a client handed in directly: replacing it is the caller's call", async () => {
+		const client = fakeClient("end");
+		const driver = new RedisDriver(client);
+
+		await driver.size();
+
+		expect(client.eval).toHaveBeenCalledOnce();
+	});
+});
+
 describeRedis("bay > RedisDriver against a live Redis", () => {
 	const redis = useRedis();
 	const connection = () => redis.manager.connection("w0");

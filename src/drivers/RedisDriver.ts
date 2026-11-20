@@ -27,6 +27,7 @@ const PRIORITY_LEVELS = 10;
 
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
 import { parseJob, type Unreadable } from "../record.js";
+import { hasEnded } from "../vendor/quasarConnection.js";
 
 /**
  * The commands this driver issues. ioredis and a `@c9up/quasar` connection
@@ -334,8 +335,22 @@ export class RedisDriver implements QueueDriver {
 	/**
 	 * The client, resolved once. Two workers racing on a cold queue must not
 	 * each open their own connection, so the in-flight promise is shared.
+	 *
+	 * Resolved AGAIN once the client it holds has ended for good: quasar
+	 * retires a connection whose retry strategy gave up and hands out a fresh
+	 * one, and keeping the dead client failed every queue operation with
+	 * "Connection is closed." until restart. NAMED DEVIATION, better than
+	 * upstream: Adonis' queue and lock capture `ioConnection` once and keep the
+	 * same hole. A client handed in directly is kept whatever its state.
 	 */
 	async #client(): Promise<RedisClient> {
+		if (
+			this.#resolved &&
+			typeof this.#source === "function" &&
+			hasEnded(this.#resolved)
+		) {
+			this.#resolved = undefined;
+		}
 		if (this.#resolved) return this.#resolved;
 		if (typeof this.#source !== "function") {
 			checkClient(this.#source);
