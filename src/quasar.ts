@@ -14,21 +14,13 @@ import {
 	quasarConnection as loadQuasarConnection,
 } from "./vendor/quasarConnection.js";
 
-// The commands this driver actually issues — every non-optional member of
-// `RedisClient`. `evalsha` is optional: without it scripts are sent in full.
-const REQUIRED = ["eval", "rpush", "zadd", "lrange"] as const;
+// The commands this driver actually issues — every member of `RedisClient`.
+// Scripts run through EVALSHA, loaded with SCRIPT LOAD when missing.
+const REQUIRED = ["evalsha", "script", "rpush", "zadd", "lrange"] as const;
 
-/**
- * The connection is handed over only once it carries every command above.
- * `evalsha` stays optional, but when there it has to be a function too.
- */
+/** The connection is handed over only once it carries every command above. */
 function isRedisClient(value: unknown): value is RedisClient {
-	return (
-		hasCommands(value, REQUIRED) &&
-		(!("evalsha" in value) ||
-			value.evalsha === undefined ||
-			typeof value.evalsha === "function")
-	);
+	return hasCommands(value, REQUIRED);
 }
 
 /**

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
 	type RedisClient,
@@ -13,6 +14,7 @@ import {
 	intercept,
 	useRedis,
 } from "../__helpers__/redis.js";
+import { scripting } from "../__helpers__/scripting.js";
 
 function makeJob(over: Partial<JobRecord> = {}): JobRecord {
 	return {
@@ -33,7 +35,8 @@ function inertClient(): RedisClient {
 		throw new Error("not connected");
 	};
 	return {
-		eval: never,
+		evalsha: never,
+		script: never,
 		rpush: never,
 		zadd: never,
 		lrange: never,
@@ -52,25 +55,29 @@ describe("bay > RedisDriver > config validation", () => {
 		).not.toThrow();
 	});
 
-	/** A client shaped like one from before scripts — no `eval`. */
-	function withoutEval(): object {
+	/** A client lacking one of the two scripting commands. */
+	function without(command: "evalsha" | "script"): object {
 		const client = { ...inertClient() };
-		Reflect.deleteProperty(client, "eval");
+		Reflect.deleteProperty(client, command);
 		return client;
 	}
 
-	it("refuses a client that cannot run a script", () => {
-		expect(() => Reflect.construct(RedisDriver, [withoutEval()])).toThrow(
-			/needs EVAL/,
-		);
+	it("refuses a client that cannot run a script by digest or load one", () => {
+		for (const command of ["evalsha", "script"] as const) {
+			expect(() => Reflect.construct(RedisDriver, [without(command)])).toThrow(
+				/needs EVALSHA and SCRIPT LOAD/,
+			);
+		}
 	});
 
 	it("refuses it when the client comes from a resolver too", async () => {
 		const driver: unknown = Reflect.construct(RedisDriver, [
-			() => withoutEval(),
+			() => without("script"),
 		]);
 		if (!(driver instanceof RedisDriver)) throw new Error("expected a driver");
-		await expect(driver.size()).rejects.toThrow(/needs EVAL/);
+		await expect(driver.size()).rejects.toThrow(
+			/needs EVALSHA and SCRIPT LOAD/,
+		);
 	});
 });
 
@@ -82,9 +89,12 @@ describe("bay > RedisDriver > config validation", () => {
  */
 describe("bay > RedisDriver > a connection that ended for good", () => {
 	function fakeClient(status: string) {
+		// Counts the scripts that actually ran, whatever loading took.
+		const ran = vi.fn(() => 0);
 		return {
 			status,
-			eval: vi.fn(async () => 0),
+			ran,
+			...scripting(ran),
 			rpush: vi.fn(async () => 1),
 			zadd: vi.fn(async () => 1),
 			lrange: vi.fn(async (): Promise<string[]> => []),
@@ -106,8 +116,8 @@ describe("bay > RedisDriver > a connection that ended for good", () => {
 		await driver.size();
 
 		expect(resolver).toHaveBeenCalledTimes(2);
-		expect(first.eval).toHaveBeenCalledOnce();
-		expect(second.eval).toHaveBeenCalledTimes(2);
+		expect(first.ran).toHaveBeenCalledOnce();
+		expect(second.ran).toHaveBeenCalledTimes(2);
 	});
 
 	it("keeps a client that closed but reconnects by itself", async () => {
@@ -128,7 +138,83 @@ describe("bay > RedisDriver > a connection that ended for good", () => {
 
 		await driver.size();
 
-		expect(client.eval).toHaveBeenCalledOnce();
+		expect(client.ran).toHaveBeenCalledOnce();
+	});
+});
+
+/**
+ * Scripts run only by digest. A server that does not know one answers
+ * NOSCRIPT, which means the script did not run: the driver loads it and asks
+ * again. Any other failure may have come after the script ran, so it is never
+ * retried.
+ */
+describe("bay > RedisDriver > scripts by digest", () => {
+	function recordingClient() {
+		const calls: string[] = [];
+		const commands = scripting(() => 0);
+		const client: RedisClient = {
+			evalsha: async (sha1) => {
+				calls.push("evalsha");
+				return commands.evalsha(sha1);
+			},
+			script: async (subcommand, lua) => {
+				calls.push("script");
+				return commands.script(subcommand, lua);
+			},
+			rpush: async () => 1,
+			zadd: async () => 1,
+			lrange: async () => [],
+		};
+		return { client, calls, commands };
+	}
+
+	it("loads a script the server does not know, then runs it by digest", async () => {
+		const { client, calls, commands } = recordingClient();
+		const driver = new RedisDriver(client);
+
+		await expect(driver.size()).resolves.toBe(0);
+
+		expect(calls).toEqual(["evalsha", "script", "evalsha"]);
+		const [digest] = defined(commands.evalsha.mock.calls[0]);
+		const [subcommand, lua] = defined(commands.script.mock.calls[0]);
+		expect(subcommand).toBe("LOAD");
+		expect(createHash("sha1").update(lua).digest("hex")).toBe(digest);
+	});
+
+	it("loads each script once, and only runs it by digest afterwards", async () => {
+		const { client, calls } = recordingClient();
+		const driver = new RedisDriver(client);
+
+		await driver.size();
+		await driver.size();
+		await driver.size();
+
+		expect(calls).toEqual([
+			"evalsha",
+			"script",
+			"evalsha",
+			"evalsha",
+			"evalsha",
+		]);
+	});
+
+	it("does not retry a script that failed for any other reason", async () => {
+		const script = vi.fn(async () => "sha");
+		const evalsha = vi.fn(async (): Promise<unknown> => {
+			throw new Error("ECONNRESET");
+		});
+		const driver = new RedisDriver({
+			evalsha,
+			script,
+			rpush: async () => 1,
+			zadd: async () => 1,
+			lrange: async () => [],
+		});
+
+		await expect(driver.size()).rejects.toThrow("ECONNRESET");
+
+		expect(evalsha).toHaveBeenCalledOnce();
+		expect(script).not.toHaveBeenCalled();
 	});
 });
 
@@ -254,7 +340,7 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 		expect(await connection().exists(`${base}pending`)).toBe(0);
 	});
 
-	it("sends each script once and addresses it by digest afterwards", async () => {
+	it("loads each script once and addresses it by digest afterwards", async () => {
 		const prefix = freshPrefix("evalsha");
 		// Forget every script, so the first call has to send it.
 		await connection().script("FLUSH");
@@ -270,11 +356,13 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 		await driver.pop();
 		await driver.pop();
 
-		// At most one full send per script — two here, the push and the
-		// acquire (another test file may load them first) — always after a
-		// digest attempt, and the digest afterwards.
-		const scripted = calls.filter((c) => c === "eval" || c === "evalsha");
-		expect(scripted.filter((c) => c === "eval").length).toBeLessThanOrEqual(2);
+		// At most one load per script — two here, the push and the acquire
+		// (another test file may load them first) — always after a digest
+		// attempt, and the digest afterwards.
+		const scripted = calls.filter((c) => c === "script" || c === "evalsha");
+		expect(scripted.filter((c) => c === "script").length).toBeLessThanOrEqual(
+			2,
+		);
 		expect(scripted[0]).toBe("evalsha");
 		expect(scripted.at(-1)).toBe("evalsha");
 	});

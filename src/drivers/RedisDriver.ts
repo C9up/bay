@@ -39,19 +39,19 @@ import { hasEnded } from "../vendor/quasarConnection.js";
 /**
  * The commands this driver issues. ioredis and a `@c9up/quasar` connection
  * have every one of them.
+ *
+ * Scripts run only through EVALSHA, loaded with SCRIPT LOAD when the server
+ * does not know them yet, so a client must answer both: EVAL alone is no
+ * longer enough. Supply-chain scanners report a `.eval` call as dynamic code
+ * execution, and EVALSHA also avoids resending the script on every move.
  */
 export interface RedisClient {
-	eval(
-		script: string,
-		numKeys: number,
-		...args: (string | number)[]
-	): Promise<unknown>;
-	/** Optional: without it every script is sent in full. */
-	evalsha?(
+	evalsha(
 		sha1: string,
 		numKeys: number,
 		...args: (string | number)[]
 	): Promise<unknown>;
+	script(subcommand: "LOAD", script: string): Promise<unknown>;
 	rpush(key: string, ...values: string[]): Promise<number>;
 	zadd(key: string, score: number, member: string): Promise<number | string>;
 	lrange(key: string, start: number, stop: number): Promise<string[]>;
@@ -356,10 +356,14 @@ export type RedisClientSource =
 	| (() => RedisClient | Promise<RedisClient>);
 
 function checkClient(client: RedisClient): void {
-	if (typeof client.eval === "function") return;
+	if (
+		typeof client.evalsha === "function" &&
+		typeof client.script === "function"
+	)
+		return;
 	throw new Error(
-		"[bay] RedisDriver needs EVAL (Redis 2.6+): every move of a job is one server-side script, " +
-			"so that a dropped connection can never leave it half-moved. ioredis and @c9up/quasar connections have it.",
+		"[bay] RedisDriver needs EVALSHA and SCRIPT LOAD (Redis 2.6+): every move of a job is one server-side script, " +
+			"so that a dropped connection can never leave it half-moved. ioredis and @c9up/quasar connections have them.",
 	);
 }
 
@@ -591,24 +595,23 @@ export class RedisDriver implements QueueDriver {
 		];
 	}
 
-	/** Run a script by digest, sending it in full only when the server lacks it. */
+	/** Run a script by digest, loading it first only when the server lacks it. */
 	async #run(
 		client: RedisClient,
 		{ lua, sha }: Script,
 		keys: string[],
 		args: (string | number)[],
 	): Promise<unknown> {
-		if (client.evalsha) {
-			try {
-				return await client.evalsha(sha, keys.length, ...keys, ...args);
-			} catch (err) {
-				// Only "unknown script" falls through. Every other error may
-				// have come after the script ran, and running it twice is not
-				// safe.
-				if (!isNoScript(err)) throw err;
-			}
+		try {
+			return await client.evalsha(sha, keys.length, ...keys, ...args);
+		} catch (err) {
+			// Only "unknown script" falls through: it means the script did not
+			// run, so loading it and running it again is safe. Every other error
+			// may have come after the script ran, and running it twice is not.
+			if (!isNoScript(err)) throw err;
 		}
-		return client.eval(lua, keys.length, ...keys, ...args);
+		await client.script("LOAD", lua);
+		return client.evalsha(sha, keys.length, ...keys, ...args);
 	}
 
 	async push(job: JobRecord): Promise<string | undefined> {

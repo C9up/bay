@@ -10,9 +10,10 @@ import {
 } from "../../src/drivers/RedisDriver.js";
 import type { JobRecord } from "../../src/QueueManager.js";
 import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
+import { scripting } from "../__helpers__/scripting.js";
 
 const inert = (): RedisClient => ({
-	eval: async () => null,
+	...scripting(),
 	rpush: async () => 0,
 	zadd: async () => 0,
 	lrange: async () => [],

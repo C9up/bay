@@ -244,8 +244,12 @@ A job the queue accepted gets run. On Redis every move of a job — taken off a
 queue, completed, retried, failed, promoted from its delay, reclaimed from a
 dead worker — is **one server-side script**, so it happens entirely or not at
 all. A connection dropped halfway through a move leaves the job where it was,
-never in neither place. Scripts need nothing newer than Redis 2.6; the client
-must answer `eval` (ioredis and every `@c9up/quasar` connection do).
+never in neither place. Scripts need nothing newer than Redis 2.6. They run
+only through `EVALSHA`, loaded with `SCRIPT LOAD` the first time the server
+lacks one, so the client must answer `evalsha` and `script` — `eval` alone is
+no longer enough (ioredis and every `@c9up/quasar` connection do). Supply-chain
+scanners report a `.eval` call as dynamic code execution, and the digest also
+avoids resending the script on every move.
 
 A record that can never run — unreadable JSON, a shape no version of bay wrote —
 is filed in the failed list with the reason, rather than deleted.

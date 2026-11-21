@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { type JobRecord, QueueManager } from "../../src/QueueManager.js";
 import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
+import { scripting } from "../__helpers__/scripting.js";
 
 function makeJob(id: string): JobRecord {
 	return {
@@ -248,7 +249,7 @@ describeRedis("bay > stalled jobs", () => {
 describe("bay > recovery bounds are validated", () => {
 	it("refuses a maxStalledCount or maxFailedJobs that is not a count", () => {
 		const client = {
-			eval: async () => null,
+			...scripting(),
 			rpush: async () => 0,
 			zadd: async () => 0,
 			lrange: async () => [],

@@ -34,7 +34,7 @@ function makeJob(id: string, over: Partial<JobRecord> = {}): JobRecord {
 }
 
 /** Commands that put a job somewhere, whatever the driver calls them. */
-const WRITES = new Set(["rpush", "eval", "evalsha"]);
+const WRITES = new Set(["rpush", "evalsha"]);
 
 /**
  * A client whose next write after `arm()` fails — before reaching the server,

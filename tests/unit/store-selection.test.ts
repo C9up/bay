@@ -8,6 +8,7 @@ import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { QueueManager } from "../../src/QueueManager.js";
 import { defined } from "../__helpers__/defined.js";
+import { scripting } from "../__helpers__/scripting.js";
 
 /**
  * `{ default, adapters }` — the shape a package takes when several backends are
@@ -120,7 +121,7 @@ describe("bay > store selection", () => {
 		expect(
 			stores.redis({
 				connection: {
-					eval: async () => null,
+					...scripting(),
 					rpush: async () => 1,
 					zadd: async () => 1,
 					lrange: async () => [],

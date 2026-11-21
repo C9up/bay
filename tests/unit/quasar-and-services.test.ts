@@ -20,7 +20,7 @@ import queue, {
 const SPECIFIER = "@c9up/quasar/services/main";
 
 /** Every command the redis driver actually issues. */
-const commands = ["eval", "rpush", "zadd", "lrange"];
+const commands = ["evalsha", "script", "rpush", "zadd", "lrange"];
 
 const client = (omit?: string) =>
 	Object.fromEntries(
@@ -121,14 +121,6 @@ describe("bay > the quasar bridge", () => {
 				new RegExp(`connection 'jobs' is missing ${missing}`),
 			);
 		}
-	});
-
-	it("accepts a connection without evalsha", async () => {
-		// The driver declares `evalsha` optional and sends scripts in full when
-		// it is not there, so demanding it would reject a connection that works.
-		mockQuasar({ default: { connection: () => client() } });
-
-		await expect((await load())("jobs")()).resolves.toBeDefined();
 	});
 
 	it("resolves nothing until the queue is used", async () => {
