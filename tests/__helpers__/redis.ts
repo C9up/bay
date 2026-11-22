@@ -4,7 +4,8 @@
  * Every state transition of the Redis driver is a server-side script, and a
  * hand-written fake cannot run one — a fake that re-implemented the scripts in
  * JavaScript would test the re-implementation. So these suites talk to a real
- * server, and are skipped (not failed) where none answers. CI starts one.
+ * server. Without `REDIS_TEST_URL` they are skipped, locally only: on CI, or
+ * with a URL nothing answers, the file fails instead.
  *
  * Probed through quasar (a devDependency here) rather than ioredis, which bay
  * deliberately does not depend on.
@@ -36,6 +37,15 @@ async function serverAnswers(): Promise<boolean> {
 }
 
 export const live = url ? await serverAnswers() : false;
+// Set means meant, and CI always sets it: a URL that answers nothing, or no
+// URL at all on CI, fails the file instead of quietly skipping the suite.
+if ((url !== "" || process.env.CI === "true") && !live) {
+	throw new Error(
+		url === ""
+			? "REDIS_TEST_URL is not set on CI: refusing to skip the live-Redis suite."
+			: `REDIS_TEST_URL is set (${url}) but no server answers: refusing to skip the live-Redis suite.`,
+	);
+}
 
 /** A `describe` that only runs where a Redis answers. */
 export function describeRedis(name: string, body: () => void): void {
