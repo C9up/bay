@@ -51,7 +51,14 @@ describe("bay > a timed-out handler", () => {
 		await queue.processOne();
 
 		expect(seen?.aborted).toBe(true);
-		expect((await queue.failedJobs())[0]?.error).toMatch(/10ms timeout/);
+		expect(seen?.reason).toMatchObject({
+			code: "E_JOB_TIMEOUT",
+			job: "slow",
+			timeout: 10,
+		});
+		expect((await queue.failedJobs())[0]?.error).toBe(
+			'The job "slow" has exceeded the timeout of 10ms',
+		);
 	});
 
 	it("aborts this.signal on a job class, and leaves it alone within the timeout", async () => {

@@ -12,6 +12,7 @@
  * worker and lets the job in flight finish rather than dropping it.
  */
 
+import { E_QUEUE_NOT_INITIALIZED } from "../errors.js";
 import { getQueue } from "../services/main.js";
 import { type BayCommandClass, flag } from "./contract.js";
 
@@ -50,10 +51,10 @@ export function queueWorkCommand(): BayCommandClass {
 			if (!manager) {
 				// Naming the wiring beats a stack trace out of the service proxy:
 				// the usual cause is a project that never added the provider.
-				throw new Error(
+				throw new E_QUEUE_NOT_INITIALIZED([
 					"[bay] queue:work found no queue. Add `() => import('@c9up/bay/provider')` " +
 						"to the providers in reamrc.ts, or call setQueue(myQueue) at boot.",
-				);
+				]);
 			}
 
 			const queues = parseQueues(this.queue);

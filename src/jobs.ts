@@ -21,6 +21,10 @@
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+	E_BAY_JOBS_DIRECTORY_UNREADABLE,
+	E_BAY_NO_JOBS_FOUND,
+} from "./errors.js";
 import { isJobClass, type JobClass } from "./Job.js";
 
 /** Where `make:job` writes, and where discovery looks when nothing is declared. */
@@ -68,10 +72,8 @@ async function walk(dir: string, depth = 0): Promise<string[]> {
 		// with no handlers and nothing said — the queue accepted jobs and
 		// processed none of them.
 		if (Reflect.get(Object(err), "code") === "ENOENT") return [];
-		throw new Error(
-			`[bay] cannot read the jobs directory '${dir}': ${
-				err instanceof Error ? err.message : String(err)
-			}`,
+		throw new E_BAY_JOBS_DIRECTORY_UNREADABLE(
+			[dir, err instanceof Error ? err.message : String(err)],
 			{ cause: err },
 		);
 	}
@@ -167,9 +169,10 @@ export async function discoverJobs(
 	// the wrong thing — a rename, a forgotten `export default` — produced an
 	// empty discovery and a silent worker.
 	if (found.length === 0 && scanned > 0) {
-		throw new Error(
-			`[bay] ${scanned} job file(s) were scanned and none yielded a Job, so the worker has no handlers:\n  ${[...failures, ...rejected].join("\n  ")}`,
-		);
+		throw new E_BAY_NO_JOBS_FOUND([
+			scanned,
+			[...failures, ...rejected].join("\n  "),
+		]);
 	}
 	return found;
 }

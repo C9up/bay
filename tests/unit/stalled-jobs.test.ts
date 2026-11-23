@@ -78,6 +78,9 @@ describeRedis("bay > stalled jobs", () => {
 			expect(await connection().llen(`${prefix}pending`)).toBe(0);
 			const failed = await first.failed();
 			expect(failed.map((job) => job.stalledCount)).toEqual([2]);
+			expect(failed.map((job) => job.error)).toEqual([
+				'The job "work" stalled more than the allowed 1 time(s)',
+			]);
 		});
 
 		it("honours a larger maxStalledCount", async () => {
@@ -256,7 +259,10 @@ describe("bay > recovery bounds are validated", () => {
 		};
 		for (const bad of [-1, 1.5, Number.NaN]) {
 			expect(() => new RedisDriver(client, { maxStalledCount: bad })).toThrow(
-				/maxStalledCount/,
+				expect.objectContaining({
+					code: "E_CONFIGURATION_ERROR",
+					message: expect.stringMatching(/maxStalledCount/),
+				}),
 			);
 			expect(() => new RedisDriver(client, { maxFailedJobs: bad })).toThrow(
 				/maxFailedJobs/,

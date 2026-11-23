@@ -86,7 +86,12 @@ describe("bay > the quasar bridge", () => {
 		});
 
 		await expect((await load())("jobs")()).rejects.toThrow(
-			/@c9up\/quasar is not installed[\s\S]*pnpm add @c9up\/quasar/,
+			expect.objectContaining({
+				code: "E_BAY_QUASAR_MISSING",
+				message: expect.stringMatching(
+					/@c9up\/quasar is not installed[\s\S]*pnpm add @c9up\/quasar/,
+				),
+			}),
 		);
 	});
 
@@ -118,7 +123,12 @@ describe("bay > the quasar bridge", () => {
 			// The message names the connection AND the missing command — the
 			// point of checking before handing it over.
 			await expect((await load())("jobs")(), missing).rejects.toThrow(
-				new RegExp(`connection 'jobs' is missing ${missing}`),
+				expect.objectContaining({
+					code: "E_BAY_INCOMPLETE_CONNECTION",
+					message: expect.stringMatching(
+						new RegExp(`connection 'jobs' is missing ${missing}`),
+					),
+				}),
 			);
 		}
 	});
@@ -169,6 +179,24 @@ describe("bay > the provider", () => {
 		expect(await context.container.resolve("queue")).toBeInstanceOf(
 			QueueManager,
 		);
+	});
+
+	it("refuses a config.queue that is not a queue config", async () => {
+		const context = app({ jobFactory: "not a function" });
+		new BayProvider(context).register();
+		await expect(context.container.resolve(QueueManager)).rejects.toMatchObject(
+			{ code: "E_CONFIGURATION_ERROR" },
+		);
+	});
+
+	it("refuses a container that rebound the manager to something else", async () => {
+		const context = app(defineConfig({}));
+		const provider = new BayProvider(context);
+		provider.register();
+		context.bindings.set(QueueManager, () => ({ notAQueue: true }));
+		await expect(provider.boot()).rejects.toMatchObject({
+			code: "E_BAY_INVALID_BINDING",
+		});
 	});
 
 	it("stops the worker at shutdown", async () => {
@@ -259,7 +287,10 @@ describe("bay > the service accessor", () => {
 
 	it("says what to wire when it is read before boot", () => {
 		expect(() => queue.dispatch).toThrow(
-			/accessed before BayProvider.boot\(\)/,
+			expect.objectContaining({
+				code: "E_QUEUE_NOT_INITIALIZED",
+				message: expect.stringMatching(/accessed before BayProvider.boot\(\)/),
+			}),
 		);
 	});
 
@@ -327,6 +358,11 @@ describe("bay > when jobs are discovered", () => {
 		const provider = new BayProvider(app(["./nowhere"]));
 		provider.register();
 
-		await expect(provider.ready()).rejects.toThrow(/before boot\(\)/);
+		await expect(provider.ready()).rejects.toThrow(
+			expect.objectContaining({
+				code: "E_QUEUE_NOT_INITIALIZED",
+				message: expect.stringMatching(/before boot\(\)/),
+			}),
+		);
 	});
 });

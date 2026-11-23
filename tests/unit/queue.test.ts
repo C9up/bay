@@ -65,7 +65,9 @@ describe("queue > MemoryDriver", () => {
 		await strict.processOne();
 		const failed = await strict.failedJobs();
 		expect(failed).toHaveLength(1);
-		expect(defined(failed[0]).error).toContain("No handler");
+		expect(defined(failed[0]).error).toBe(
+			'Requested job "unknown.job" is not registered',
+		);
 	});
 
 	it("puts a job no handler answers to back instead, by default", async () => {

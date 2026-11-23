@@ -174,7 +174,14 @@ describe("bay > priority and dedup options are checked", () => {
 			await expect(
 				queue.dispatch("job", {}, { priority: bad }),
 				String(bad),
-			).rejects.toThrow(/priority must be a whole number from 1 to 10/);
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "E_BAY_INVALID_PRIORITY",
+					message: expect.stringMatching(
+						/priority must be a whole number from 1 to 10/,
+					),
+				}),
+			);
 		}
 		class Odd extends Job {
 			static override options = { priority: 42 };
@@ -187,7 +194,12 @@ describe("bay > priority and dedup options are checked", () => {
 		const queue = new QueueManager(new MemoryDriver());
 		await expect(
 			queue.dispatch("job", {}, { dedup: { id: "" } }),
-		).rejects.toThrow(/dedup.id/);
+		).rejects.toThrow(
+			expect.objectContaining({
+				code: "E_BAY_INVALID_DEDUP",
+				message: expect.stringMatching(/dedup.id/),
+			}),
+		);
 		await expect(
 			queue.dispatch("job", {}, { dedup: { id: "a", extend: true } }),
 		).rejects.toThrow(/extend needs a ttl/);

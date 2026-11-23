@@ -33,7 +33,12 @@ describe("bay > job names", () => {
 		};
 		queue.registerJob(first);
 		expect(() => queue.registerJob(second)).toThrow(
-			/two job classes answer to 'SendEmail'.*options\.name/s,
+			expect.objectContaining({
+				code: "E_BAY_DUPLICATE_JOB",
+				message: expect.stringMatching(
+					/two job classes answer to 'SendEmail'.*options\.name/s,
+				),
+			}),
 		);
 		// The same class twice is not a conflict.
 		expect(() => queue.registerJob(first)).not.toThrow();

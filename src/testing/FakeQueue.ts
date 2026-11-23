@@ -9,6 +9,8 @@
  * the fake into a runtime build.
  */
 
+import { AssertionError } from "node:assert";
+import { E_BAY_DUPLICATE_JOB_ID, E_BAY_FAKE_JOB_NOT_FOUND } from "../errors.js";
 import { DEFAULT_QUEUE } from "../Job.js";
 import { type JobRecord, type QueueDriver, queueOf } from "../QueueManager.js";
 import { snapshot } from "../record.js";
@@ -44,9 +46,7 @@ export class FakeQueue implements QueueDriver {
 		// mistake — two `makeJob({ id: 'x' })` reused across pushes
 		// silently corrupts later `fail`/`complete`/`retry` lookups.
 		if (this.#pushed.some((j) => j.id === job.id)) {
-			throw new Error(
-				`FakeQueue: duplicate job id '${job.id}' — each push must use a unique id (the real drivers enforce this implicitly via crypto.randomUUID()).`,
-			);
+			throw new E_BAY_DUPLICATE_JOB_ID([job.id]);
 		}
 		const dedup = job.dedup;
 		if (dedup !== undefined) {
@@ -132,9 +132,7 @@ export class FakeQueue implements QueueDriver {
 	#requireJob(job: JobRecord, verb: string): JobRecord {
 		const found = this.#pushed.find((j) => j.id === job.id);
 		if (!found) {
-			throw new Error(
-				`FakeQueue.${verb}: job id '${job.id}' is not in the queue. Did you forget to push it, or is it from a different FakeQueue instance?`,
-			);
+			throw new E_BAY_FAKE_JOB_NOT_FOUND([verb, job.id]);
 		}
 		return found;
 	}
@@ -172,18 +170,22 @@ export class FakeQueue implements QueueDriver {
 	assertPushed(name: string, predicate?: FakeQueuePredicateArg): void {
 		const match = makeMatcher(name, predicate);
 		if (this.#pushed.some(match)) return;
-		throw new Error(
-			`queue.assertPushed('${name}'${describePredicate(predicate)}) failed — no captured job matches.\n${describeCaptured(this.#pushed)}`,
-		);
+		// node:assert's error, as the library's fake throws: a test runner
+		// reports it as a failed assertion, not as a crash.
+		throw new AssertionError({
+			message: `queue.assertPushed('${name}'${describePredicate(predicate)}) failed — no captured job matches.\n${describeCaptured(this.#pushed)}`,
+			stackStartFn: this.assertPushed,
+		});
 	}
 
 	assertNotPushed(name: string, predicate?: FakeQueuePredicateArg): void {
 		const match = makeMatcher(name, predicate);
 		const found = this.#pushed.find(match);
 		if (!found) return;
-		throw new Error(
-			`queue.assertNotPushed('${name}'${describePredicate(predicate)}) failed — at least one captured job matches.\n${describeCaptured(this.#pushed)}`,
-		);
+		throw new AssertionError({
+			message: `queue.assertNotPushed('${name}'${describePredicate(predicate)}) failed — at least one captured job matches.\n${describeCaptured(this.#pushed)}`,
+			stackStartFn: this.assertNotPushed,
+		});
 	}
 }
 

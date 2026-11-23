@@ -65,7 +65,10 @@ describe("bay > RedisDriver > config validation", () => {
 	it("refuses a client that cannot run a script by digest or load one", () => {
 		for (const command of ["evalsha", "script"] as const) {
 			expect(() => Reflect.construct(RedisDriver, [without(command)])).toThrow(
-				/needs EVALSHA and SCRIPT LOAD/,
+				expect.objectContaining({
+					code: "E_BAY_INCOMPLETE_CONNECTION",
+					message: expect.stringMatching(/needs EVALSHA and SCRIPT LOAD/),
+				}),
 			);
 		}
 	});

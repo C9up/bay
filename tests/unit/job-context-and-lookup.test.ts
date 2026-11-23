@@ -119,7 +119,10 @@ describe("bay > Job.dispatch() and Job.dispatchMany()", () => {
 
 	it("refuses to dispatch before a queue is bound, naming what to do", async () => {
 		await expect(SendEmail.dispatch({ to: "c@x.test" }).run()).rejects.toThrow(
-			/setQueue|BayProvider/,
+			expect.objectContaining({
+				code: "E_QUEUE_NOT_INITIALIZED",
+				message: expect.stringMatching(/setQueue|BayProvider/),
+			}),
 		);
 	});
 });

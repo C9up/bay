@@ -119,7 +119,12 @@ describe("bay > queue:work", () => {
 	it("names the wiring when no queue was ever bound", async () => {
 		const QueueWork = queueWorkCommand();
 		await expect(new QueueWork().run()).rejects.toThrow(
-			/Add `\(\) => import\('@c9up\/bay\/provider'\)`/,
+			expect.objectContaining({
+				code: "E_QUEUE_NOT_INITIALIZED",
+				message: expect.stringMatching(
+					/Add `\(\) => import\('@c9up\/bay\/provider'\)`/,
+				),
+			}),
 		);
 	});
 
@@ -315,7 +320,12 @@ describe("bay > finding the job classes", () => {
 		try {
 			await fsp.writeFile(path.join(dir, "a.mjs"), "export default null\n");
 
-			await expect(discoverJobs([dir])).rejects.toThrow(/none yielded a Job/);
+			await expect(discoverJobs([dir])).rejects.toThrow(
+				expect.objectContaining({
+					code: "E_BAY_NO_JOBS_FOUND",
+					message: expect.stringMatching(/none yielded a Job/),
+				}),
+			);
 		} finally {
 			stderr.mockRestore();
 		}
@@ -381,7 +391,10 @@ export default class SendEmail extends Job { async execute() {} }
 		await fsp.writeFile(notADirectory, "not a directory\n");
 
 		await expect(discoverJobs([notADirectory])).rejects.toThrow(
-			/cannot read the jobs directory/,
+			expect.objectContaining({
+				code: "E_BAY_JOBS_DIRECTORY_UNREADABLE",
+				message: expect.stringMatching(/cannot read the jobs directory/),
+			}),
 		);
 	});
 

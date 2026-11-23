@@ -91,7 +91,9 @@ describe("bay > QueueManager > processOne", () => {
 			await q.dispatch("missing-handler", null);
 			expect(await q.processOne()).toBe(true);
 			expect(driver.failArgs).toHaveLength(1);
-			expect(driver.failArgs[0]?.error).toMatch(/No handler registered/);
+			expect(driver.failArgs[0]?.error).toBe(
+				'Requested job "missing-handler" is not registered',
+			);
 		} finally {
 			stderrSpy.mockRestore();
 		}
@@ -185,7 +187,10 @@ describe("bay > QueueManager > work / stop", () => {
 	it("rejects idleDelay <= 0 (would busy-loop)", async () => {
 		const q = new QueueManager(new CapturingDriver());
 		await expect(q.work(0)).rejects.toThrow(/idleDelay must be a delay from 1/);
-		await expect(q.work(-1)).rejects.toThrow(/idleDelay/);
+		await expect(q.work(-1)).rejects.toMatchObject({
+			code: "E_INVALID_DURATION_EXPRESSION",
+			help: expect.stringMatching(/idleDelay/),
+		});
 	});
 
 	it("refuses to start a second concurrent work() loop", async () => {
@@ -194,7 +199,12 @@ describe("bay > QueueManager > work / stop", () => {
 		// Kick off work() but stop it on the next tick so the test doesn't hang.
 		const looping = q.work(10);
 		await Promise.resolve();
-		await expect(q.work(10)).rejects.toThrow(/already running/);
+		await expect(q.work(10)).rejects.toThrow(
+			expect.objectContaining({
+				code: "E_WORKER_ALREADY_RUNNING",
+				message: expect.stringMatching(/already running/),
+			}),
+		);
 		await q.stop();
 		await looping;
 	});

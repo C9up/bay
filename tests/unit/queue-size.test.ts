@@ -49,7 +49,12 @@ describe("bay > queue size", () => {
 		};
 		const queue = new QueueManager(minimal);
 		expect(await queue.sizeOf("default")).toBe(0);
-		await expect(queue.sizeOf("emails")).rejects.toThrow(/sizeOf/);
+		await expect(queue.sizeOf("emails")).rejects.toThrow(
+			expect.objectContaining({
+				code: "E_BAY_UNSUPPORTED_OPERATION",
+				message: expect.stringMatching(/sizeOf/),
+			}),
+		);
 	});
 });
 

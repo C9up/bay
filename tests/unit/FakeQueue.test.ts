@@ -78,18 +78,33 @@ describe("FakeQueue — QueueDriver surface", () => {
 		expect(captured.processedAt).toBeUndefined();
 	});
 
+	it("push refuses a record Redis could not store", async () => {
+		const q = new FakeQueue();
+		await expect(q.push(makeJob({ maxAttempts: 0 }))).rejects.toMatchObject({
+			code: "E_BAY_UNSERIALIZABLE_JOB",
+		});
+	});
+
 	it("push rejects duplicate ids", async () => {
 		const q = new FakeQueue();
 		await q.push(makeJob({ id: "dup" }));
 		await expect(q.push(makeJob({ id: "dup" }))).rejects.toThrow(
-			/duplicate job id/,
+			expect.objectContaining({
+				code: "E_BAY_DUPLICATE_JOB_ID",
+				message: expect.stringMatching(/duplicate job id/),
+			}),
 		);
 	});
 
 	it("fail throws when job id is not in the queue", async () => {
 		const q = new FakeQueue();
 		const orphan = makeJob({ id: "never-pushed" });
-		await expect(q.fail(orphan, "oops")).rejects.toThrow(/not in the queue/);
+		await expect(q.fail(orphan, "oops")).rejects.toThrow(
+			expect.objectContaining({
+				code: "E_BAY_FAKE_JOB_NOT_FOUND",
+				message: expect.stringMatching(/not in the queue/),
+			}),
+		);
 	});
 
 	it("complete throws when job id is not in the queue", async () => {
@@ -158,7 +173,11 @@ describe("FakeQueue — assertPushed", () => {
 		const q = new FakeQueue();
 		await q.push(makeJob({ name: "send-email" }));
 		expect(() => q.assertPushed("process-payment")).toThrow(
-			/no captured job matches/,
+			expect.objectContaining({
+				name: "AssertionError",
+				code: "ERR_ASSERTION",
+				message: expect.stringMatching(/no captured job matches/),
+			}),
 		);
 	});
 
@@ -228,7 +247,11 @@ describe("FakeQueue — assertNotPushed", () => {
 		const q = new FakeQueue();
 		await q.push(makeJob({ name: "a" }));
 		expect(() => q.assertNotPushed("a")).toThrow(
-			/at least one captured job matches/,
+			expect.objectContaining({
+				name: "AssertionError",
+				code: "ERR_ASSERTION",
+				message: expect.stringMatching(/at least one captured job matches/),
+			}),
 		);
 	});
 

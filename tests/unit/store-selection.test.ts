@@ -72,7 +72,7 @@ describe("bay > store selection", () => {
 	it("refuses a `default` that names nothing, listing what exists", () => {
 		expect(() =>
 			managerFrom({ default: "redis", stores: { memory: stores.memory() } }),
-		).toThrow(/not in `stores`.*Declared: memory/s);
+		).toThrow(/not found in stores configuration\. Declared: memory/);
 	});
 
 	it("refuses a `default` that only names something on Object.prototype", () => {
@@ -88,20 +88,57 @@ describe("bay > store selection", () => {
 			expect(() =>
 				managerFrom({ default: name, adapters: { memory: drivers.memory() } }),
 			).toThrow(
-				new RegExp(`names the adapter '${name}', which is not in \`adapters\``),
+				expect.objectContaining({
+					code: "E_CONFIGURATION_ERROR",
+					message: expect.stringContaining(
+						`Configuration error. Reason: Default adapter "${name}" not found in adapters configuration.`,
+					),
+				}),
 			);
 		}
+	});
+
+	it("wraps an adapter factory that throws, keeping its error as the cause", () => {
+		const down = new Error("connection refused");
+		expect(() =>
+			managerFrom({
+				default: "redis",
+				adapters: {
+					redis: () => {
+						throw down;
+					},
+				},
+			}),
+		).toThrow(
+			expect.objectContaining({
+				code: "E_ADAPTER_INIT_ERROR",
+				status: 500,
+				message:
+					'Failed to initialize adapter "redis". Reason: connection refused',
+				cause: down,
+			}),
+		);
 	});
 
 	it("refuses an adapter factory that does not build a driver", () => {
 		expect(() =>
 			managerFrom({ default: "broken", adapters: { broken: () => ({}) } }),
-		).toThrow(/adapter 'broken' did not build a queue driver/);
+		).toThrow(
+			expect.objectContaining({
+				code: "E_BAY_INVALID_ADAPTER",
+				message: expect.stringMatching(
+					/adapter 'broken' did not build a queue driver/,
+				),
+			}),
+		);
 	});
 
 	it("refuses `stores` with no `default`", () => {
 		expect(() => managerFrom({ stores: { memory: stores.memory() } })).toThrow(
-			/no `default`/,
+			expect.objectContaining({
+				code: "E_CONFIGURATION_ERROR",
+				message: expect.stringMatching(/no `default`/),
+			}),
 		);
 	});
 
@@ -112,7 +149,10 @@ describe("bay > store selection", () => {
 
 	it("points a non-memory `driver` at the adapters form", () => {
 		expect(() => managerFrom({ driver: "redis" })).toThrow(
-			/name it under `adapters`/,
+			expect.objectContaining({
+				code: "E_BAY_UNSUPPORTED_DRIVER",
+				message: expect.stringMatching(/name it under `adapters`/),
+			}),
 		);
 	});
 
@@ -173,10 +213,10 @@ describe("bay > the names upstream uses", () => {
 	it("names the key the config actually used when it complains", () => {
 		expect(() =>
 			managerFrom({ default: "redis", adapters: { memory: drivers.memory() } }),
-		).toThrow(/not in `adapters`/);
+		).toThrow(/not found in adapters configuration/);
 		expect(() =>
 			managerFrom({ default: "redis", stores: { memory: drivers.memory() } }),
-		).toThrow(/not in `stores`/);
+		).toThrow(/not found in stores configuration/);
 	});
 
 	it("is one namespace under two names", () => {

@@ -11,6 +11,13 @@
  * service it calls is down spends every attempt within milliseconds.
  */
 
+import {
+	E_BAY_INVALID_ATTEMPTS,
+	E_CONFIGURATION_ERROR,
+	E_INVALID_BASE_DELAY,
+	E_INVALID_MAX_DELAY,
+	E_INVALID_MULTIPLIER,
+} from "./errors.js";
 import { type Duration, toMilliseconds } from "./Job.js";
 
 export interface BackoffConfig {
@@ -47,28 +54,41 @@ export class BackoffStrategy {
 
 	constructor(config: BackoffConfig | ResolvedBackoff) {
 		if (!STRATEGIES.has(config.strategy)) {
-			throw new Error(
+			throw new E_CONFIGURATION_ERROR([
 				`backoff strategy must be exponential, linear or fixed, got ${String(config.strategy)}`,
-			);
+			]);
 		}
 		const baseDelay = toMilliseconds(config.baseDelay, "backoff baseDelay");
 		if (!(baseDelay > 0)) {
-			throw new Error("backoff baseDelay must be greater than zero");
+			throw new E_INVALID_BASE_DELAY([
+				"Base delay must be a positive integer greater than zero",
+			]);
 		}
 		const maxDelay =
 			config.maxDelay === undefined
 				? undefined
 				: toMilliseconds(config.maxDelay, "backoff maxDelay");
+		if (maxDelay !== undefined && !(maxDelay > 0)) {
+			throw new E_INVALID_MAX_DELAY([
+				"Max delay must be a positive integer greater than zero",
+			]);
+		}
 		if (maxDelay !== undefined && maxDelay <= baseDelay) {
-			throw new Error("backoff maxDelay must be greater than baseDelay");
+			throw new E_INVALID_MAX_DELAY([
+				"Max delay should be greater than base delay",
+			]);
 		}
 		const multiplier = config.multiplier;
 		if (multiplier !== undefined) {
 			if (!Number.isFinite(multiplier) || multiplier <= 0) {
-				throw new Error("backoff multiplier must be a number above zero");
+				throw new E_INVALID_MULTIPLIER([
+					"Multiplier must be a positive number greater than zero",
+				]);
 			}
 			if (config.strategy === "exponential" && multiplier < 1) {
-				throw new Error("an exponential backoff multiplier must be >= 1");
+				throw new E_INVALID_MULTIPLIER([
+					"Exponential strategy multiplier should be >= 1",
+				]);
 			}
 		}
 		this.#config = {
@@ -83,7 +103,10 @@ export class BackoffStrategy {
 	/** The delay before attempt `attempt + 1`, after attempt `attempt` failed (1-based). */
 	calculateDelay(attempt: number): number {
 		if (!Number.isInteger(attempt) || attempt < 1) {
-			throw new Error("backoff attempt number must be a whole number >= 1");
+			throw new E_BAY_INVALID_ATTEMPTS([
+				"backoff attempt number",
+				String(attempt),
+			]);
 		}
 		const { strategy, baseDelay, maxDelay, jitter } = this.#config;
 		const multiplier = this.#config.multiplier ?? 2;

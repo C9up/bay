@@ -2,6 +2,14 @@ import type { AdapterFactory } from "./adapters.js";
 import "./augmentations.js";
 import { MemoryDriver } from "./drivers/MemoryDriver.js";
 import {
+	E_ADAPTER_INIT_ERROR,
+	E_BAY_INVALID_ADAPTER,
+	E_BAY_INVALID_BINDING,
+	E_BAY_UNSUPPORTED_DRIVER,
+	E_CONFIGURATION_ERROR,
+	E_QUEUE_NOT_INITIALIZED,
+} from "./errors.js";
+import {
 	DEFAULT_JOBS_DIR,
 	directoryOf,
 	discoverJobs,
@@ -118,9 +126,9 @@ function readConfig(app: BayAppContext): BayProviderConfig | undefined {
 	const value = app.config.get("queue");
 	if (value === undefined) return undefined;
 	if (!isProviderConfig(value)) {
-		throw new Error(
-			"[bay] config.queue must be the object `defineConfig({...})` returns",
-		);
+		throw new E_CONFIGURATION_ERROR([
+			"config.queue must be the object `defineConfig({...})` returns",
+		]);
 	}
 	return value;
 }
@@ -128,7 +136,7 @@ function readConfig(app: BayAppContext): BayProviderConfig | undefined {
 async function resolveQueue(app: BayAppContext): Promise<QueueManager> {
 	const queue = await app.container.resolve(QueueManager);
 	if (!(queue instanceof QueueManager)) {
-		throw new Error("[bay] the container did not answer a QueueManager");
+		throw new E_BAY_INVALID_BINDING();
 	}
 	return queue;
 }
@@ -197,35 +205,39 @@ function buildDriver(config: BayProviderConfig | undefined): QueueDriver {
 		const selected = Object.hasOwn(adapters, name) ? adapters[name] : undefined;
 		if (typeof selected !== "function") {
 			const known = Object.keys(adapters);
-			throw new Error(
-				`[bay] config.queue names the adapter '${name}', which is not in \`${key}\`. ` +
-					(known.length > 0
+			throw new E_CONFIGURATION_ERROR([
+				`Default adapter "${name}" not found in ${key} configuration. ${
+					known.length > 0
 						? `Declared: ${known.join(", ")}.`
-						: `\`${key}\` is empty — declare one with drivers.memory() or drivers.redis().`),
+						: `\`${key}\` is empty — declare one with drivers.memory() or drivers.redis().`
+				}`,
+			]);
+		}
+		let driver: unknown;
+		try {
+			driver = selected();
+		} catch (error) {
+			throw new E_ADAPTER_INIT_ERROR(
+				[name, error instanceof Error ? error.message : String(error)],
+				{ cause: error },
 			);
 		}
-		const driver: unknown = selected();
 		if (!isQueueDriver(driver)) {
-			throw new Error(
-				`[bay] the adapter '${name}' did not build a queue driver — an adapter factory answers an object with push(), pop(), complete(), fail(), retry(), failed() and size().`,
-			);
+			throw new E_BAY_INVALID_ADAPTER([name]);
 		}
 		return driver;
 	}
 
 	if (adapters && name === undefined) {
-		throw new Error(
-			`[bay] config.queue declares \`${key}\` but no \`default\` naming which one to use. ` +
+		throw new E_CONFIGURATION_ERROR([
+			`config.queue declares \`${key}\` but no \`default\` naming which one to use. ` +
 				`Set default to one of: ${Object.keys(adapters).join(", ")}.`,
-		);
+		]);
 	}
 
 	const driverName = config?.driver ?? "memory";
 	if (driverName !== "memory") {
-		throw new Error(
-			`[bay] Unsupported driver '${driverName}' — name it under \`adapters\` instead: ` +
-				"adapters: { redis: drivers.redis({ connection: 'main' }) }.",
-		);
+		throw new E_BAY_UNSUPPORTED_DRIVER([driverName]);
 	}
 	return new MemoryDriver();
 }
@@ -297,9 +309,9 @@ export default class BayProvider {
 	async ready(): Promise<void> {
 		const queue = this.#queue;
 		if (queue === undefined) {
-			throw new Error(
+			throw new E_QUEUE_NOT_INITIALIZED([
 				"BayProvider.ready() ran before boot() — providers boot before they are ready.",
-			);
+			]);
 		}
 		const config = readConfig(this.app);
 		const locations = config?.locations ?? [DEFAULT_JOBS_DIR];

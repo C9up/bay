@@ -13,6 +13,7 @@
  * groups, and one queue manager drives one store.
  */
 
+import { E_QUEUE_NOT_INITIALIZED } from "./errors.js";
 import type { Duration, JobClass } from "./Job.js";
 import type { DispatchOptions, QueueManager } from "./QueueManager.js";
 import { getQueue } from "./services/main.js";
@@ -30,9 +31,9 @@ export interface DispatchManyResult {
 function boundQueue(): QueueManager {
 	const queue = getQueue();
 	if (queue === undefined) {
-		throw new Error(
+		throw new E_QUEUE_NOT_INITIALIZED([
 			"[bay] Job.dispatch() needs a queue: register BayProvider, or bind one with setQueue(queue) from '@c9up/bay/services/main'.",
-		);
+		]);
 	}
 	return queue;
 }

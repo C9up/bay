@@ -62,14 +62,14 @@ describe("bay > a job is a class", () => {
 
 	it("calls failed() once, after the last attempt — not after each one", async () => {
 		const attempts: number[] = [];
-		const failures: string[] = [];
+		const failures: Error[] = [];
 		class Flaky extends Job {
 			async execute(): Promise<void> {
 				attempts.push(attempts.length + 1);
 				throw new Error("nope");
 			}
 			override async failed(error: Error): Promise<void> {
-				failures.push(error.message);
+				failures.push(error);
 			}
 		}
 		const queue = new QueueManager(new MemoryDriver());
@@ -78,7 +78,34 @@ describe("bay > a job is a class", () => {
 		await drainAll(queue);
 
 		expect(attempts).toHaveLength(3);
-		expect(failures).toEqual(["nope"]);
+		// Retries ran out: the hook gets the library's error, caused by the
+		// attempt's own; the failed record keeps the attempt's message.
+		expect(failures).toHaveLength(1);
+		expect(failures[0]).toMatchObject({
+			code: "E_JOB_MAX_ATTEMPTS_REACHED",
+			message:
+				'The job "Flaky" has reached the maximum number of retry attempts',
+			cause: expect.objectContaining({ message: "nope" }),
+		});
+		expect((await queue.failedJobs())[0]?.error).toBe("nope");
+	});
+
+	it("hands failed() the attempt's own error when no retry was allowed", async () => {
+		const failures: Error[] = [];
+		class Once extends Job {
+			async execute(): Promise<void> {
+				throw new Error("once");
+			}
+			override async failed(error: Error): Promise<void> {
+				failures.push(error);
+			}
+		}
+		const queue = new QueueManager(new MemoryDriver());
+
+		await queue.dispatch(Once, {}, { maxAttempts: 1 });
+		await drainAll(queue);
+
+		expect(failures.map((error) => error.message)).toEqual(["once"]);
 	});
 
 	it("reports a throwing failed() instead of failing the job twice", async () => {
@@ -218,9 +245,20 @@ describe("bay > a delayed job", () => {
 	it("refuses a duration it cannot read rather than parking the job forever", () => {
 		// `NaN` would become a `runAt` no clock ever reaches, with nothing to
 		// read about it.
-		expect(() => toMilliseconds("soon", "delay")).toThrow(/delay must be/);
+		expect(() => toMilliseconds("soon", "delay")).toThrow(
+			expect.objectContaining({
+				code: "E_INVALID_DURATION_EXPRESSION",
+				message: 'Invalid duration expression: "soon"',
+				help: expect.stringMatching(/delay must be/),
+			}),
+		);
 		expect(() => toMilliseconds("10 weeks", "delay")).toThrow();
-		expect(() => toMilliseconds(-1, "delay")).toThrow(/non-negative/);
+		expect(() => toMilliseconds(-1, "delay")).toThrow(
+			expect.objectContaining({
+				code: "E_INVALID_DURATION_EXPRESSION",
+				help: expect.stringMatching(/non-negative/),
+			}),
+		);
 	});
 });
 
@@ -242,7 +280,7 @@ describe("bay > a job that takes too long", () => {
 
 		// Filed as failed at its deadline, while the handler is still going.
 		const failed = await driver.failed();
-		expect(failed[0]?.error).toMatch(/exceeded its 20ms timeout/);
+		expect(failed[0]?.error).toMatch(/exceeded the timeout of 20ms/);
 		expect(finished).toBe(false);
 
 		expect(await processing).toBe(true);
@@ -265,7 +303,10 @@ describe("bay > a worker running several at once", () => {
 	it("refuses a concurrency that is not a whole number >= 1", async () => {
 		const queue = new QueueManager(new MemoryDriver());
 		await expect(queue.work({ concurrency: 0 })).rejects.toThrow(
-			/concurrency must be/,
+			expect.objectContaining({
+				code: "E_BAY_INVALID_WORKER_OPTIONS",
+				message: expect.stringMatching(/concurrency must be/),
+			}),
 		);
 		await expect(queue.work({ concurrency: 1.5 })).rejects.toThrow(
 			/concurrency must be/,
@@ -343,7 +384,10 @@ describe("bay > make:job", () => {
 
 	it("refuses a name that would leave the jobs directory", () => {
 		expect(() => resolveJobName("../../etc/passwd")).toThrow(
-			/Invalid job name/,
+			expect.objectContaining({
+				code: "E_BAY_INVALID_JOB_NAME",
+				message: expect.stringMatching(/Invalid job name/),
+			}),
 		);
 		expect(() => resolveJobName("a/../../b")).toThrow(/Invalid job name/);
 		expect(() => resolveJobName("")).toThrow(/Invalid job name/);

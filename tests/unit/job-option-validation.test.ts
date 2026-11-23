@@ -17,7 +17,14 @@ describe("bay > maxAttempts / maxRetries", () => {
 			await expect(
 				queue.dispatch("x", {}, { maxAttempts: bad }),
 				String(bad),
-			).rejects.toThrow(/maxAttempts must be a whole number >= 1/);
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "E_BAY_INVALID_ATTEMPTS",
+					message: expect.stringMatching(
+						/maxAttempts must be a whole number >= 1/,
+					),
+				}),
+			);
 			await expect(
 				queue.dispatch("x", {}, { maxRetries: bad }),
 				String(bad),
@@ -33,7 +40,12 @@ describe("bay > maxAttempts / maxRetries", () => {
 		}
 		const queue = new QueueManager(new MemoryDriver());
 		expect(() => queue.registerJob(Forever)).toThrow(
-			/Forever.*maxRetries must be a whole number >= 1/,
+			expect.objectContaining({
+				code: "E_BAY_INVALID_JOB_OPTIONS",
+				message: expect.stringMatching(
+					/Forever.*maxRetries must be a whole number >= 1/,
+				),
+			}),
 		);
 		await expect(queue.dispatch(Forever, undefined)).rejects.toThrow(
 			/maxRetries must be a whole number >= 1/,
@@ -58,6 +70,19 @@ describe("bay > maxAttempts / maxRetries", () => {
 	});
 });
 
+describe("bay > removeOnComplete / removeOnFail", () => {
+	it("refuses a retention that is not a boolean or { age?, count? }", async () => {
+		const queue = new QueueManager(new MemoryDriver());
+		await expect(
+			queue.dispatch("x", {}, { removeOnComplete: { count: -1 } }),
+		).rejects.toMatchObject({ code: "E_BAY_INVALID_RETENTION" });
+		await expect(
+			queue.dispatch("x", {}, { removeOnFail: { age: 1.5 } }),
+		).rejects.toMatchObject({ code: "E_BAY_INVALID_RETENTION" });
+		expect(await queue.size()).toBe(0);
+	});
+});
+
 describe("bay > timeout", () => {
 	it("refuses a timeout setTimeout cannot hold, at dispatch and at registration", async () => {
 		class Month extends Job {
@@ -69,7 +94,12 @@ describe("bay > timeout", () => {
 			await expect(
 				queue.dispatch("x", {}, { timeout: bad }),
 				String(bad),
-			).rejects.toThrow(/timeout must be a whole number of milliseconds/);
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "E_INVALID_TIMEOUT",
+					message: `Invalid timeout "${String(bad)}" of job "x": use 0 for no timeout, or a whole number of milliseconds from 1 to 2147483647 (about 24.8 days)`,
+				}),
+			);
 		}
 		expect(() => queue.registerJob(Month)).toThrow(/Month.*timeout/);
 		expect(await queue.size()).toBe(0);

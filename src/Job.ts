@@ -28,6 +28,15 @@
  */
 
 import type { BackoffFactory } from "./backoff.js";
+import {
+	E_BAY_INVALID_ATTEMPTS,
+	E_BAY_INVALID_JOB_NAME,
+	E_BAY_INVALID_JOB_OPTIONS,
+	E_BAY_INVALID_PRIORITY,
+	E_BAY_INVALID_RETENTION,
+	E_INVALID_DURATION_EXPRESSION,
+	E_INVALID_TIMEOUT,
+} from "./errors.js";
 import { JobBatchDispatcher, JobDispatcher } from "./JobDispatcher.js";
 
 /** Milliseconds, or a duration the way a config file writes one. */
@@ -128,18 +137,22 @@ export function toRetention(
 	if (value === undefined || value === true) return undefined;
 	if (value === false) return { maxAge: 0, maxCount: 0 };
 	if (typeof value !== "object" || value === null) {
-		throw new Error(`${label} must be a boolean or { age?, count? }`);
+		throw new E_BAY_INVALID_RETENTION([
+			`${label} must be a boolean or { age?, count? }`,
+		]);
 	}
 	const maxAge =
 		value.age === undefined ? 0 : toMilliseconds(value.age, `${label}.age`);
 	const maxCount = value.count ?? 0;
 	if (!Number.isSafeInteger(maxCount) || maxCount < 0) {
-		throw new Error(
+		throw new E_BAY_INVALID_RETENTION([
 			`${label}.count must be a whole number >= 0, got ${String(value.count)}`,
-		);
+		]);
 	}
 	if (!Number.isSafeInteger(maxAge)) {
-		throw new Error(`${label}.age must be a whole number of milliseconds`);
+		throw new E_BAY_INVALID_RETENTION([
+			`${label}.age must be a whole number of milliseconds`,
+		]);
 	}
 	return { maxAge, maxCount };
 }
@@ -269,7 +282,7 @@ export function isJobClass(value: unknown): value is JobClass {
  */
 export function toAttemptCount(value: number, label: string): number {
 	if (!Number.isSafeInteger(value) || value < 1) {
-		throw new Error(`${label} must be a whole number >= 1, got ${value}`);
+		throw new E_BAY_INVALID_ATTEMPTS([label, String(value)]);
 	}
 	return value;
 }
@@ -280,9 +293,7 @@ export const DEFAULT_PRIORITY = 5;
 /** A priority on upstream's scale: a whole number from 1 (first) to 10. */
 export function toPriority(value: number): number {
 	if (!Number.isInteger(value) || value < 1 || value > 10) {
-		throw new Error(
-			`priority must be a whole number from 1 to 10, got ${value}`,
-		);
+		throw new E_BAY_INVALID_PRIORITY([String(value)]);
 	}
 	return value;
 }
@@ -297,14 +308,18 @@ export const MAX_TIMEOUT = 2_147_483_647;
  * `setTimeout` as-is, which Node clamps to 1 ms: the most generous timeout
  * became the strictest, and every attempt failed at once.
  */
-export function toTimeout(value: Duration | undefined): number | undefined {
+export function toTimeout(
+	value: Duration | undefined,
+	jobName?: string,
+): number | undefined {
 	if (value === undefined) return undefined;
 	const ms = toMilliseconds(value, "timeout");
 	if (ms === 0) return undefined;
-	if (!Number.isInteger(ms) || ms > MAX_TIMEOUT) {
-		throw new Error(
-			`timeout must be a whole number of milliseconds from 1 to ${MAX_TIMEOUT} (about 24.8 days), or 0 for none — got ${String(value)}`,
-		);
+	if (!Number.isInteger(ms) || ms < 1 || ms > MAX_TIMEOUT) {
+		throw new E_INVALID_TIMEOUT([
+			String(value),
+			jobName === undefined ? "" : ` of job "${jobName}"`,
+		]);
 	}
 	return ms;
 }
@@ -320,7 +335,9 @@ export function checkJobOptions(job: JobClass): void {
 			options.name !== undefined &&
 			(typeof options.name !== "string" || options.name.trim().length === 0)
 		) {
-			throw new Error("options.name must be a non-empty string");
+			throw new E_BAY_INVALID_JOB_NAME([
+				"options.name must be a non-empty string",
+			]);
 		}
 		if (options.priority !== undefined) toPriority(options.priority);
 		const maxRetries = options.maxRetries ?? options.retry?.maxRetries;
@@ -331,10 +348,24 @@ export function checkJobOptions(job: JobClass): void {
 		// Built once here so a bad strategy fails at boot, not on the retry.
 		options.retry?.backoff?.();
 	} catch (err) {
-		throw new Error(
-			`[bay] job '${job.name}': ${err instanceof Error ? err.message : String(err)}`,
+		throw new E_BAY_INVALID_JOB_OPTIONS(
+			[job.name, err instanceof Error ? err.message : String(err)],
+			{ cause: err },
 		);
 	}
+}
+
+/**
+ * The library's message names the expression only; which option held it goes
+ * in `help`, so the message stays the library's and the option is still named.
+ */
+function invalidDuration(
+	expression: string,
+	help: string,
+): InstanceType<typeof E_INVALID_DURATION_EXPRESSION> {
+	const error = new E_INVALID_DURATION_EXPRESSION([expression]);
+	error.help = help;
+	return error;
 }
 
 /**
@@ -348,14 +379,18 @@ export function checkJobOptions(job: JobClass): void {
 export function toMilliseconds(value: Duration, label: string): number {
 	if (typeof value === "number") {
 		if (!Number.isFinite(value) || value < 0) {
-			throw new Error(`${label} must be a non-negative number of milliseconds`);
+			throw invalidDuration(
+				String(value),
+				`${label} must be a non-negative number of milliseconds.`,
+			);
 		}
 		return value;
 	}
 	const match = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/.exec(value.trim());
 	if (!match) {
-		throw new Error(
-			`${label} must be a number of milliseconds or a duration like '10s', '1m', '2h' — got '${value}'`,
+		throw invalidDuration(
+			value,
+			`${label} must be a number of milliseconds or a duration like '10s', '1m', '2h'.`,
 		);
 	}
 	const amount = Number(match[1]);

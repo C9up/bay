@@ -9,6 +9,7 @@
  */
 
 import type { RedisClient } from "./drivers/RedisDriver.js";
+import { E_BAY_INCOMPLETE_CONNECTION, E_BAY_QUASAR_MISSING } from "./errors.js";
 import {
 	hasCommands,
 	quasarConnection as loadQuasarConnection,
@@ -34,6 +35,9 @@ export function quasarConnection(name?: string): () => Promise<RedisClient> {
 			required: REQUIRED,
 			isConnection: isRedisClient,
 			what: "the queue driver",
-			raise: (_reason, message, cause) => new Error(message, { cause }),
+			raise: (reason, message, cause) =>
+				reason === "quasar-missing"
+					? new E_BAY_QUASAR_MISSING([message], { cause })
+					: new E_BAY_INCOMPLETE_CONNECTION([message], { cause }),
 		});
 }

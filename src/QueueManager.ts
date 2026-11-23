@@ -1,5 +1,16 @@
 import { type ResolvedBackoff, readBackoff } from "./backoff.js";
 import {
+	E_BAY_DUPLICATE_JOB,
+	E_BAY_INVALID_DEDUP,
+	E_BAY_INVALID_JOB_FACTORY,
+	E_BAY_INVALID_WORKER_OPTIONS,
+	E_BAY_UNSUPPORTED_OPERATION,
+	E_JOB_MAX_ATTEMPTS_REACHED,
+	E_JOB_NOT_FOUND,
+	E_JOB_TIMEOUT,
+	E_WORKER_ALREADY_RUNNING,
+} from "./errors.js";
+import {
 	checkJobOptions,
 	DEFAULT_PRIORITY,
 	DEFAULT_QUEUE,
@@ -143,14 +154,6 @@ interface JobRunner {
 	onFailed?(error: Error): Promise<void> | void;
 }
 
-/** An attempt that ran out of its `timeout` — what `failOnTimeout` looks for. */
-export class JobTimeoutError extends Error {
-	constructor(name: string, ms: number) {
-		super(`Job '${name}' exceeded its ${ms}ms timeout`);
-		this.name = "JobTimeoutError";
-	}
-}
-
 /**
  * Reject once `ms` has passed, aborting `controller` so the work can stop.
  *
@@ -167,7 +170,7 @@ function withTimeout(
 	if (ms === undefined || ms <= 0) return work;
 	return new Promise<void>((resolve, reject) => {
 		const timer = setTimeout(() => {
-			const error = new JobTimeoutError(name, ms);
+			const error = new E_JOB_TIMEOUT([name, ms]);
 			controller.abort(error);
 			reject(error);
 		}, ms);
@@ -197,9 +200,9 @@ function withTimeout(
 function toPollDelay(value: Duration, label: string): number {
 	const ms = toMilliseconds(value, label);
 	if (!(ms > 0) || ms > MAX_TIMEOUT) {
-		throw new Error(
+		throw new E_BAY_INVALID_WORKER_OPTIONS([
 			`${label} must be a delay from 1 to ${MAX_TIMEOUT} ms, got ${String(value)}`,
-		);
+		]);
 	}
 	return ms;
 }
@@ -210,19 +213,21 @@ function toDedup(
 	dedup: { id: string; ttl?: Duration; extend?: boolean },
 ): { id: string; ttl?: number; extend?: boolean } {
 	if (typeof dedup.id !== "string" || dedup.id.length === 0) {
-		throw new Error("dedup.id must be a non-empty string");
+		throw new E_BAY_INVALID_DEDUP(["dedup.id must be a non-empty string"]);
 	}
 	const ttl =
 		dedup.ttl === undefined
 			? undefined
 			: toMilliseconds(dedup.ttl, "dedup.ttl");
 	if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 1)) {
-		throw new Error(
+		throw new E_BAY_INVALID_DEDUP([
 			`dedup.ttl must be a whole number of milliseconds from 1 up, got ${String(dedup.ttl)}`,
-		);
+		]);
 	}
 	if (dedup.extend && ttl === undefined) {
-		throw new Error("dedup.extend needs a ttl: there is no window to restart");
+		throw new E_BAY_INVALID_DEDUP([
+			"dedup.extend needs a ttl: there is no window to restart",
+		]);
 	}
 	return {
 		id: `${name}::${dedup.id}`,
@@ -237,9 +242,9 @@ const UNKNOWN_JOB_RETRY_DELAY = 30_000;
 function toUnknownJobRetries(value: number | undefined): number {
 	if (value === undefined) return 10;
 	if (!Number.isSafeInteger(value) || value < 0) {
-		throw new Error(
+		throw new E_BAY_INVALID_WORKER_OPTIONS([
 			`unknownJobRetries must be a whole number >= 0, got ${value}`,
-		);
+		]);
 	}
 	return value;
 }
@@ -266,15 +271,15 @@ function checkQueues(
 ): readonly string[] | undefined {
 	if (queues === undefined) return undefined;
 	if (queues.length === 0) {
-		throw new Error(
+		throw new E_BAY_INVALID_WORKER_OPTIONS([
 			"queues must name at least one queue; leave it out to serve the default one",
-		);
+		]);
 	}
 	for (const name of queues) {
 		if (typeof name !== "string" || name.trim().length === 0) {
-			throw new Error(
+			throw new E_BAY_INVALID_WORKER_OPTIONS([
 				`queues must hold non-empty names, got ${JSON.stringify(queues)}`,
-			);
+			]);
 		}
 	}
 	return queues;
@@ -482,9 +487,7 @@ export class QueueManager {
 		const name = jobNameOf(job);
 		const existing = this.#jobs.get(name);
 		if (existing !== undefined && existing !== job) {
-			throw new Error(
-				`[bay] two job classes answer to '${name}'. Give one of them a static options.name so each has its own.`,
-			);
+			throw new E_BAY_DUPLICATE_JOB([name]);
 		}
 		this.#jobs.set(name, job);
 		return name;
@@ -573,9 +576,7 @@ export class QueueManager {
 	 */
 	async getJob(jobId: string, queue?: string): Promise<JobLookup | null> {
 		if (!this.#driver.getJob) {
-			throw new Error(
-				"This queue driver has no getJob(), so it cannot look a job up",
-			);
+			throw new E_BAY_UNSUPPORTED_OPERATION(["getJob()", "look a job up"]);
 		}
 		const found = await this.#driver.getJob(jobId);
 		if (found === null) return null;
@@ -630,7 +631,7 @@ export class QueueManager {
 			queue: options.queue ?? declared.queue ?? DEFAULT_QUEUE,
 		};
 		if (delayMs > 0) record.runAt = Date.now() + delayMs;
-		const timeoutMs = toTimeout(timeout);
+		const timeoutMs = toTimeout(timeout, name);
 		if (timeoutMs !== undefined) record.timeout = timeoutMs;
 		const backoff = options.retry?.backoff ?? declared.retry?.backoff;
 		if (backoff !== undefined) record.backoff = backoff().getConfig();
@@ -683,13 +684,11 @@ export class QueueManager {
 				await this.#driver.retry(job);
 				return;
 			}
-			process.stderr.write(
-				`QueueManager: no handler registered for job '${job.name}'\n`,
-			);
-			await this.#driver.fail(
-				job,
-				`No handler registered for job: ${job.name}`,
-			);
+			// Failed with the library's error, whose message is what the failed
+			// record keeps.
+			const notFound = new E_JOB_NOT_FOUND([job.name]);
+			process.stderr.write(`QueueManager: ${notFound.message}\n`);
+			await this.#driver.fail(job, notFound.message);
 			return;
 		}
 
@@ -724,9 +723,9 @@ export class QueueManager {
 			const error = err instanceof Error ? err : new Error(String(err));
 			const errorMsg = error.message;
 			// `failOnTimeout`: a timed-out attempt is the last one.
-			const final =
-				job.attempts >= job.maxAttempts ||
-				(job.failOnTimeout === true && error instanceof JobTimeoutError);
+			const timedOutForGood =
+				job.failOnTimeout === true && error instanceof E_JOB_TIMEOUT;
+			const final = job.attempts >= job.maxAttempts || timedOutForGood;
 			if (!final) {
 				job.status = "pending";
 				// Not straight back to the head of the line: a job failing
@@ -756,8 +755,16 @@ export class QueueManager {
 				// After the last attempt, not after each one. A throw here is
 				// reported and swallowed: the job has already failed, and
 				// failing to say so must not be read as a second failure.
+				// What the hook receives is the library's: the attempt's own error
+				// when no retry was allowed or `failOnTimeout` ended it, and
+				// E_JOB_MAX_ATTEMPTS_REACHED, caused by it, once retries ran out.
+				// The failed record keeps the attempt's own message either way.
+				const hookError =
+					timedOutForGood || job.maxAttempts <= 1
+						? error
+						: new E_JOB_MAX_ATTEMPTS_REACHED([job.name], { cause: error });
 				try {
-					await runner?.onFailed?.(error);
+					await runner?.onFailed?.(hookError);
 				} catch (hookErr) {
 					process.stderr.write(
 						`QueueManager: failed() hook of '${job.name}' threw: ${
@@ -815,9 +822,9 @@ export class QueueManager {
 					? await this.#jobFactory(registered)
 					: registered;
 			if (!isJobHandler(handler)) {
-				throw new Error(
+				throw new E_BAY_INVALID_JOB_FACTORY([
 					"The job factory built something without a handle() method for a registered handler class",
-				);
+				]);
 			}
 			return {
 				run: (payload, signal, context) =>
@@ -827,9 +834,9 @@ export class QueueManager {
 		const JobConstructor = target.job;
 		const instance = await this.#jobFactory(JobConstructor);
 		if (!(instance instanceof Job)) {
-			throw new Error(
+			throw new E_BAY_INVALID_JOB_FACTORY([
 				`The job factory built ${JobConstructor.name} into something that is not an instance of it`,
-			);
+			]);
 		}
 		return {
 			run: (payload, signal, context) => {
@@ -931,7 +938,9 @@ export class QueueManager {
 		const concurrency =
 			asOptions?.concurrency ?? this.#workerDefaults.concurrency ?? 1;
 		if (!Number.isInteger(concurrency) || concurrency < 1) {
-			throw new Error("concurrency must be a whole number >= 1");
+			throw new E_BAY_INVALID_WORKER_OPTIONS([
+				"concurrency must be a whole number >= 1",
+			]);
 		}
 		if (asOptions?.unknownJobRetries !== undefined) {
 			this.#unknownJobRetries = toUnknownJobRetries(
@@ -943,7 +952,7 @@ export class QueueManager {
 		);
 
 		if (this.#running) {
-			throw new Error("QueueManager is already running");
+			throw new E_WORKER_ALREADY_RUNNING();
 		}
 		this.#running = true;
 		const loop = this.#loop(
@@ -1103,8 +1112,9 @@ export class QueueManager {
 	async sizeOf(queue: string): Promise<number> {
 		if (this.#driver.sizeOf) return this.#driver.sizeOf(queue);
 		if (queue === DEFAULT_QUEUE) return this.#driver.size();
-		throw new Error(
-			`This queue driver has no sizeOf(), so it cannot count the '${queue}' queue`,
-		);
+		throw new E_BAY_UNSUPPORTED_OPERATION([
+			"sizeOf()",
+			`count the '${queue}' queue`,
+		]);
 	}
 }

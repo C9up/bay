@@ -40,6 +40,7 @@ export type {
 	RedisDriverOptions,
 } from "./drivers/RedisDriver.js";
 export { RedisDriver } from "./drivers/RedisDriver.js";
+export * as errors from "./errors.js";
 export {
 	DEFAULT_PRIORITY,
 	DEFAULT_QUEUE,
@@ -72,7 +73,6 @@ export type {
 	WorkerOptions,
 } from "./QueueManager.js";
 export {
-	JobTimeoutError,
 	QueueManager,
 	queueOf,
 } from "./QueueManager.js";

@@ -13,6 +13,7 @@
  *   await queue.dispatch('send-email', { to: 'user@example.com' })
  */
 
+import { E_QUEUE_NOT_INITIALIZED } from "../errors.js";
 import type { QueueManager } from "../QueueManager.js";
 
 let instance: QueueManager | undefined;
@@ -50,10 +51,10 @@ const queue: QueueManager = new Proxy(target, {
 			return undefined;
 		}
 		if (!instance) {
-			throw new Error(
+			throw new E_QUEUE_NOT_INITIALIZED([
 				"[bay] QueueManager singleton accessed before BayProvider.boot() ran " +
 					"or `setQueue(myQueue)` was called. Wire one of them first.",
-			);
+			]);
 		}
 		const value = Reflect.get(instance, prop, instance);
 		return typeof value === "function" ? value.bind(instance) : value;

@@ -11,6 +11,7 @@
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { E_BAY_INVALID_JOB_NAME } from "../errors.js";
 import { argument, type BayCommandClass } from "./contract.js";
 
 export interface MakeJobOptions {
@@ -48,20 +49,20 @@ export function resolveJobName(input: string): {
 	const parts = input.split("/").filter((part) => part.length > 0);
 	const last = parts.pop();
 	if (last === undefined || last.length === 0) {
-		throw new Error(`Invalid job name: '${input}'`);
+		throw new E_BAY_INVALID_JOB_NAME([`Invalid job name: '${input}'`]);
 	}
 	for (const part of [...parts, last]) {
 		// `..` is the traversal; the rest are characters a filename has no
 		// business carrying and a shell has opinions about.
 		if (part === ".." || /[\\'";`]/.test(part)) {
-			throw new Error(`Invalid job name: '${input}'`);
+			throw new E_BAY_INVALID_JOB_NAME([`Invalid job name: '${input}'`]);
 		}
 	}
 	const className = toPascalCase(last);
 	if (!/^[A-Za-z][A-Za-z0-9]*$/.test(className)) {
-		throw new Error(
+		throw new E_BAY_INVALID_JOB_NAME([
 			`Invalid job name: '${input}' — a job's name becomes a class name`,
-		);
+		]);
 	}
 	return {
 		dir: parts.join("/"),

@@ -72,7 +72,7 @@ describe("bay > a job the worker does not know yet", () => {
 
 		const failed = await queue.failedJobs();
 		expect(failed.map((job) => [job.attempts, job.error])).toEqual([
-			[0, "No handler registered for job: gone"],
+			[0, 'Requested job "gone" is not registered'],
 		]);
 	});
 
@@ -104,7 +104,12 @@ describe("bay > a job the worker does not know yet", () => {
 		for (const bad of [-1, 1.5, Number.NaN]) {
 			expect(
 				() => new QueueManager(new MemoryDriver(), { unknownJobRetries: bad }),
-			).toThrow(/unknownJobRetries/);
+			).toThrow(
+				expect.objectContaining({
+					code: "E_BAY_INVALID_WORKER_OPTIONS",
+					message: expect.stringMatching(/unknownJobRetries/),
+				}),
+			);
 			await expect(
 				new QueueManager(new MemoryDriver()).work({ unknownJobRetries: bad }),
 			).rejects.toThrow(/unknownJobRetries/);

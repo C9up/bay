@@ -54,18 +54,39 @@ describe("bay > backoff strategies", () => {
 	});
 
 	it("refuses a configuration that cannot back off", () => {
-		expect(() => fixedBackoff(0)()).toThrow(/baseDelay/);
+		expect(() => fixedBackoff(0)()).toThrow(
+			expect.objectContaining({
+				code: "E_INVALID_BASE_DELAY",
+				message:
+					"Invalid base delay. Reason: Base delay must be a positive integer greater than zero",
+			}),
+		);
 		expect(() => linearBackoff({ baseDelay: "5s", maxDelay: "1s" })()).toThrow(
-			/maxDelay/,
+			expect.objectContaining({
+				code: "E_INVALID_MAX_DELAY",
+				message:
+					"Invalid max delay. Reason: Max delay should be greater than base delay",
+			}),
 		);
 		expect(() =>
 			exponentialBackoff({ baseDelay: 100, multiplier: 0.5 })(),
-		).toThrow(/multiplier/);
+		).toThrow(
+			expect.objectContaining({
+				code: "E_INVALID_MULTIPLIER",
+				message:
+					"Invalid multiplier. Reason: Exponential strategy multiplier should be >= 1",
+			}),
+		);
 		expect(() =>
 			new BackoffStrategy({ strategy: "fixed", baseDelay: 10 }).calculateDelay(
 				0,
 			),
-		).toThrow(/attempt/);
+		).toThrow(
+			expect.objectContaining({
+				code: "E_BAY_INVALID_ATTEMPTS",
+				message: expect.stringMatching(/attempt/),
+			}),
+		);
 	});
 });
 

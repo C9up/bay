@@ -20,6 +20,12 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import {
+	E_BAY_INCOMPLETE_CONNECTION,
+	E_BAY_UNEXPECTED_REPLY,
+	E_CONFIGURATION_ERROR,
+	E_JOB_STALLED,
+} from "../errors.js";
 import { DEFAULT_PRIORITY, DEFAULT_QUEUE } from "../Job.js";
 
 /** Priorities run from 1 to this, upstream's scale. */
@@ -361,10 +367,10 @@ function checkClient(client: RedisClient): void {
 		typeof client.script === "function"
 	)
 		return;
-	throw new Error(
+	throw new E_BAY_INCOMPLETE_CONNECTION([
 		"[bay] RedisDriver needs EVALSHA and SCRIPT LOAD (Redis 2.6+): every move of a job is one server-side script, " +
 			"so that a dropped connection can never leave it half-moved. ioredis and @c9up/quasar connections have them.",
-	);
+	]);
 }
 
 /**
@@ -386,7 +392,7 @@ function isNoScript(err: unknown): boolean {
 function readAcquired(reply: unknown): { raw: string; id?: string } | null {
 	if (reply === null || reply === false || reply === undefined) return null;
 	if (!Array.isArray(reply) || typeof reply[0] !== "string") {
-		throw new Error("[bay] unexpected reply from the acquire script");
+		throw new E_BAY_UNEXPECTED_REPLY(["acquire"]);
 	}
 	const id: unknown = reply[1];
 	return { raw: reply[0], id: typeof id === "string" ? id : undefined };
@@ -482,25 +488,25 @@ export class RedisDriver implements QueueDriver {
 		// `SET … PX <ms>` refuses anything but a positive integer, and a pop that
 		// cannot lease would take a job and drop it. Fail closed at config time.
 		if (!Number.isInteger(visibilityTimeout) || visibilityTimeout <= 0) {
-			throw new Error(
-				`[bay] RedisDriver visibilityTimeoutMs must be a positive integer (ms), got ${visibilityTimeout}`,
-			);
+			throw new E_CONFIGURATION_ERROR([
+				`RedisDriver visibilityTimeoutMs must be a positive integer (ms), got ${visibilityTimeout}`,
+			]);
 		}
 		this.#visibilityTimeout = visibilityTimeout;
 
 		const maxStalled = options?.maxStalledCount ?? 1;
 		if (!Number.isInteger(maxStalled) || maxStalled < 0) {
-			throw new Error(
-				`[bay] RedisDriver maxStalledCount must be a non-negative integer, got ${maxStalled}`,
-			);
+			throw new E_CONFIGURATION_ERROR([
+				`RedisDriver maxStalledCount must be a non-negative integer, got ${maxStalled}`,
+			]);
 		}
 		this.#maxStalledCount = maxStalled;
 
 		const maxFailed = options?.maxFailedJobs ?? 1000;
 		if (!Number.isInteger(maxFailed) || maxFailed < 0) {
-			throw new Error(
-				`[bay] RedisDriver maxFailedJobs must be a non-negative integer, got ${maxFailed}`,
-			);
+			throw new E_CONFIGURATION_ERROR([
+				`RedisDriver maxFailedJobs must be a non-negative integer, got ${maxFailed}`,
+			]);
 		}
 		this.#maxFailedJobs = maxFailed;
 	}
@@ -942,7 +948,10 @@ export class RedisDriver implements QueueDriver {
 			const exhausted = stalled > this.#maxStalledCount;
 			if (exhausted) {
 				job.status = "failed";
-				job.error = `Stalled ${stalled} time(s) without completing (maxStalledCount ${this.#maxStalledCount})`;
+				job.error = new E_JOB_STALLED([
+					job.name,
+					this.#maxStalledCount,
+				]).message;
 			} else {
 				job.status = "pending";
 			}
@@ -999,7 +1008,7 @@ export class RedisDriver implements QueueDriver {
 		const client = await this.#client();
 		const total = await this.#run(client, SIZE, this.#levels(queue), []);
 		if (typeof total !== "number") {
-			throw new Error("[bay] unexpected reply from the size script");
+			throw new E_BAY_UNEXPECTED_REPLY(["size"]);
 		}
 		return total;
 	}

@@ -6,6 +6,7 @@
  * back through here.
  */
 
+import { E_BAY_UNSERIALIZABLE_JOB } from "./errors.js";
 import type { JobRecord } from "./QueueManager.js";
 
 function isValidJob(obj: unknown): obj is JobRecord {
@@ -67,7 +68,7 @@ export function parseJob(raw: string): Parsed {
 export function snapshot(job: JobRecord): JobRecord {
 	const parsed = parseJob(JSON.stringify(job));
 	if (!parsed.ok) {
-		throw new Error(`[bay] cannot store job '${job.id}': ${parsed.reason}`);
+		throw new E_BAY_UNSERIALIZABLE_JOB([job.id, parsed.reason]);
 	}
 	return parsed.job;
 }
