@@ -47,28 +47,49 @@ if ((url !== "" || process.env.CI === "true") && !live) {
 	);
 }
 
-/** A `describe` that only runs where a Redis answers. */
-export function describeRedis(name: string, body: () => void): void {
-	if (live) describe(name, body);
-	else describe.skip(name, body);
-}
+/**
+ * Every live suite runs twice: on a bare connection, and on one that sets
+ * `keyPrefix`, the documented way two applications share one database. The
+ * client prefixes the KEYS of a script and nothing in its ARGV, so a script
+ * that builds a key from an argument writes it outside the connection's
+ * prefix: only the prefixed run sees that.
+ */
+export const KEY_PREFIXES = ["", "bay-app:"] as const;
 
 /** Separate sockets, so concurrent workers really race on the server. */
 export const WORKERS = 12;
-const connections = Object.fromEntries(
-	Array.from({ length: WORKERS }, (_, i) => [`w${i}`, { url }]),
-);
 
-/**
- * One manager for a whole test file, bound into quasar's service slot so
- * `quasarConnection('wN')` resolves the way an application's does.
- */
-export function useRedis(): {
-	manager: QuasarManager<typeof connections>;
+function connectionsFor(keyPrefix: string) {
+	return Object.fromEntries(
+		Array.from({ length: WORKERS }, (_, i) => [`w${i}`, { url, keyPrefix }]),
+	);
+}
+type Connections = ReturnType<typeof connectionsFor>;
+
+/** One suite's live Redis. */
+export interface LiveRedis {
+	manager: QuasarManager<Connections>;
+	/** The `keyPrefix` every connection of this run sets. */
+	keyPrefix: string;
 	/** A connection as the driver sees it. */
 	client(worker?: number): Promise<RedisClient>;
-} {
-	const manager = new QuasarManager({ connection: "w0", connections });
+	/**
+	 * The keys matching `pattern`, as a prefixed connection names them. KEYS
+	 * takes a pattern, not a key, so the client does not prefix it, and answers
+	 * full names: both are adjusted here.
+	 */
+	keys(pattern: string): Promise<string[]>;
+}
+
+/**
+ * One manager per run of a suite, bound into quasar's service slot so
+ * `quasarConnection('wN')` resolves the way an application's does.
+ */
+function useRedis(keyPrefix: string): LiveRedis {
+	const manager = new QuasarManager({
+		connection: "w0",
+		connections: connectionsFor(keyPrefix),
+	});
 	beforeAll(() => {
 		setQuasar(manager);
 	});
@@ -78,8 +99,29 @@ export function useRedis(): {
 	});
 	return {
 		manager,
+		keyPrefix,
 		client: (worker = 0) => quasarConnection(`w${worker}`)(),
+		keys: async (pattern) => {
+			const found = await manager.connection("w0").keys(keyPrefix + pattern);
+			return found.map((key) => key.slice(keyPrefix.length));
+		},
 	};
+}
+
+/**
+ * A `describe` that only runs where a Redis answers, once per entry of
+ * {@link KEY_PREFIXES}.
+ */
+export function describeRedis(
+	name: string,
+	body: (redis: LiveRedis) => void,
+): void {
+	for (const keyPrefix of KEY_PREFIXES) {
+		const title =
+			keyPrefix === "" ? name : `${name} (connection keyPrefix '${keyPrefix}')`;
+		const register = live ? describe : describe.skip;
+		register(title, () => body(useRedis(keyPrefix)));
+	}
 }
 
 let sequence = 0;
@@ -112,11 +154,11 @@ export function intercept(
 
 /** Every list and sorted-set entry under `prefix`, raw. */
 export async function entriesUnder(
-	manager: QuasarManager<typeof connections>,
+	redis: LiveRedis,
 	prefix: string,
 ): Promise<Record<string, string[]>> {
-	const connection = manager.connection("w0");
-	const keys = (await connection.keys(`${prefix}*`)).sort();
+	const connection = redis.manager.connection("w0");
+	const keys = (await redis.keys(`${prefix}*`)).sort();
 	const out: Record<string, string[]> = {};
 	for (const key of keys) {
 		const type = await connection.type(key);
@@ -130,11 +172,11 @@ export async function entriesUnder(
 
 /** The keys under `prefix` holding an entry whose record carries `id`. */
 export async function whereIs(
-	manager: QuasarManager<typeof connections>,
+	redis: LiveRedis,
 	prefix: string,
 	id: string,
 ): Promise<string[]> {
-	const all = await entriesUnder(manager, prefix);
+	const all = await entriesUnder(redis, prefix);
 	return Object.entries(all)
 		.filter(([key, values]) =>
 			values.some(

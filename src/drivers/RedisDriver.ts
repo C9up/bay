@@ -17,6 +17,14 @@
  * A lease is a token unique to one pop. Only the worker holding that token may
  * renew or settle the job: a worker whose lease lapsed — its job recovered and
  * taken by somebody else — can no longer touch the new owner's claim.
+ *
+ * Every key a script touches reaches it through KEYS, never ARGV: a key a
+ * script builds itself (a lease, a dedup id, a lookup hash) is built from a
+ * prefix passed in KEYS. The client applies a connection's `keyPrefix` to
+ * KEYS only, and Redis Cluster routes on KEYS only; a key taken from ARGV
+ * landed outside the connection's prefix, where no other command looked for
+ * it. "None" is an empty ARGV, never an empty key, which the client would turn
+ * into the bare connection prefix.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -38,6 +46,7 @@ import {
 	type JobStatus,
 	type QueueDriver,
 	queueOf,
+	type StaleRecovery,
 } from "../QueueManager.js";
 import { parseJob, type Unreadable } from "../record.js";
 import { hasEnded } from "../vendor/quasarConnection.js";
@@ -101,14 +110,17 @@ function script(lua: string): Script {
  * The id is read straight off the record (`dispatch` writes it first); the
  * decoder is the fallback for a record written in another key order. A record
  * neither can read is taken without a lease, and the caller files it as failed.
+ *
+ * KEYS: processing, lease prefix, lookup-hash prefix, then the queues' levels.
+ * ARGV: now, token, ttl, levels per queue.
  */
 const ACQUIRE = script(String.raw`
 local processing = KEYS[1]
+local lease_prefix = KEYS[2]
+local job_prefix = KEYS[3]
 local now = ARGV[1]
 local token = ARGV[2]
 local ttl = ARGV[3]
-local lease_prefix = ARGV[4]
-local job_prefix = ARGV[6]
 
 local function job_id(raw)
   local id = string.match(raw, '^{"id":"([^"\\]+)"')
@@ -122,8 +134,8 @@ end
 
 -- Each queue brings one pending list and one delayed set per priority,
 -- most urgent first.
-local levels = tonumber(ARGV[5])
-for q = 2, #KEYS, levels * 2 do
+local levels = tonumber(ARGV[4])
+for q = 4, #KEYS, levels * 2 do
   for l = 0, levels - 1 do
     local pending = KEYS[q + l * 2]
     local delayed = KEYS[q + l * 2 + 1]
@@ -154,11 +166,13 @@ return false
 
 /**
  * A dedup id is stored as `<ttl>:<job id>` — the ttl so `extend` restarts the
- * window the first dispatch opened, the id so only that job releases it.
+ * window the first dispatch opened, the id so only that job releases it. The
+ * key is the dedup prefix (a KEYS entry) and the id (an ARGV, empty for none).
  */
 const RELEASE_DEDUP = `
-local function release_dedup(key, job_id)
-  if key == '' then return end
+local function release_dedup(dedup_prefix, dedup_id, job_id)
+  if dedup_id == '' then return end
+  local key = dedup_prefix .. dedup_id
   local held = redis.call('GET', key)
   if held and string.match(held, '^%d+:(.*)$') == job_id then
     redis.call('DEL', key)
@@ -175,13 +189,16 @@ end
  * Redis 2.6 still runs it.
  */
 const JOB_STATE = `
-local function waiting(job_key, status, entry)
-  if job_key == '' or redis.call('EXISTS', job_key) == 0 then return end
+local function waiting(job_prefix, job_id, status, entry)
+  if job_id == '' then return end
+  local job_key = job_prefix .. job_id
+  if redis.call('EXISTS', job_key) == 0 then return end
   redis.call('HMSET', job_key, 'status', status, 'data', entry)
 end
 
-local function finish(job_key, history_key, status, entry, keep, max_age, max_count, now, job_prefix, err)
-  if job_key == '' then return end
+local function finish(job_prefix, job_id, history_key, status, entry, keep, max_age, max_count, now, err)
+  if job_id == '' then return end
+  local job_key = job_prefix .. job_id
   redis.call('DEL', job_key)
   if keep ~= '1' then return end
   redis.call('HMSET', job_key, 'status', status, 'data', entry, 'finishedAt', now)
@@ -189,7 +206,7 @@ local function finish(job_key, history_key, status, entry, keep, max_age, max_co
   max_age = tonumber(max_age)
   max_count = tonumber(max_count)
   if max_age <= 0 and max_count <= 0 then return end
-  redis.call('RPUSH', history_key, string.sub(job_key, string.len(job_prefix) + 1))
+  redis.call('RPUSH', history_key, job_id)
   if max_age > 0 then
     local cutoff = tonumber(now) - max_age
     while true do
@@ -217,28 +234,29 @@ const GET_JOB = script(`return redis.call('HGETALL', KEYS[1])`);
  * Queue a job unless another holds its dedup id — one step, so two
  * dispatches racing on one id queue one job — and open its lookup hash.
  *
- * KEYS: dedup id (empty for none), destination, lookup hash. ARGV: job id,
- * entry, mode (`list` | `zset`), score, ttl (0 for none), extend (`1` | `0`),
- * status (`pending` | `delayed`). Answers the holder's id, or false when this
- * job was queued.
+ * KEYS: dedup prefix, destination, lookup hash. ARGV: job id, entry, mode
+ * (`list` | `zset`), score, ttl (0 for none), extend (`1` | `0`), status
+ * (`pending` | `delayed`), dedup id (empty for none). Answers the holder's id,
+ * or false when this job was queued.
  */
 const PUSH = script(`
-if KEYS[1] ~= '' then
-  local held = redis.call('GET', KEYS[1])
+if ARGV[8] ~= '' then
+  local dedup_key = KEYS[1] .. ARGV[8]
+  local held = redis.call('GET', dedup_key)
   if held then
     local ttl, holder = string.match(held, '^(%d+):(.*)$')
     if holder then
       if ARGV[6] == '1' and tonumber(ttl) > 0 then
-        redis.call('PEXPIRE', KEYS[1], ttl)
+        redis.call('PEXPIRE', dedup_key, ttl)
       end
       return holder
     end
   end
   local ttl = tonumber(ARGV[5])
   if ttl > 0 then
-    redis.call('SET', KEYS[1], ARGV[5] .. ':' .. ARGV[1], 'PX', ttl)
+    redis.call('SET', dedup_key, ARGV[5] .. ':' .. ARGV[1], 'PX', ttl)
   else
-    redis.call('SET', KEYS[1], '0:' .. ARGV[1])
+    redis.call('SET', dedup_key, '0:' .. ARGV[1])
   end
 end
 if ARGV[3] == 'zset' then
@@ -273,12 +291,12 @@ return 0
  * Settle a job the caller holds: drop its entry and lease, and put it where it
  * goes next. A caller whose lease is gone changes nothing.
  *
- * KEYS: lease, processing, destination, dedup id (empty for none), lookup
- * hash and history list (both empty for none). ARGV: token, stored entry, mode
- * (`complete` | `list` | `zset` | `failed`), new entry, score or failed cap,
- * job id, then the lookup's: record, kept (`1` | `0`), max age, max count,
- * now, hash prefix, error. A job that is done or finally failed lets its dedup
- * id go; a retried one still holds it.
+ * KEYS: lease, processing, destination, dedup prefix, lookup-hash prefix,
+ * history list. ARGV: token, stored entry, mode (`complete` | `list` | `zset`
+ * | `failed`), new entry, score or failed cap, job id (empty when the entry
+ * has no lookup hash), dedup id (empty for none), then the lookup's: record,
+ * kept (`1` | `0`), max age, max count, now, error. A job that is done or
+ * finally failed lets its dedup id go; a retried one still holds it.
  */
 const SETTLE = script(`
 ${RELEASE_DEDUP}
@@ -301,12 +319,12 @@ elseif mode == 'failed' then
   end
 end
 if mode == 'complete' or mode == 'failed' then
-  release_dedup(KEYS[4], ARGV[6])
-  finish(KEYS[5], KEYS[6], mode == 'complete' and 'completed' or 'failed', ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11], ARGV[12], ARGV[13])
+  release_dedup(KEYS[4], ARGV[7], ARGV[6])
+  finish(KEYS[5], ARGV[6], KEYS[6], mode == 'complete' and 'completed' or 'failed', ARGV[8], ARGV[9], ARGV[10], ARGV[11], ARGV[12], ARGV[13])
 elseif mode == 'zset' then
-  waiting(KEYS[5], 'delayed', ARGV[7])
+  waiting(KEYS[5], ARGV[6], 'delayed', ARGV[8])
 else
-  waiting(KEYS[5], 'pending', ARGV[7])
+  waiting(KEYS[5], ARGV[6], 'pending', ARGV[8])
 end
 return 1
 `);
@@ -315,16 +333,16 @@ return 1
  * Move one orphaned entry out of `processing`, unless it is leased after all.
  * The LREM is the claim: of two passes over the same entry, one moves it.
  *
- * KEYS: processing, destination, lease (empty when the record has no id),
- * dedup id (empty for none), lookup hash and history list (both empty for
- * none). ARGV: stored entry, mode (`list` | `failed`), new entry, failed cap,
- * job id, then the lookup's: kept (`1` | `0`), max age, max count, now, hash
- * prefix, error.
+ * KEYS: processing, destination, lease prefix, dedup prefix, lookup-hash
+ * prefix, history list. ARGV: stored entry, mode (`list` | `failed`), new
+ * entry, failed cap, job id (empty when the entry has no lookup hash), lease
+ * id (empty when the record has no id), dedup id (empty for none), then the
+ * lookup's: kept (`1` | `0`), max age, max count, now, error.
  */
 const RECOVER = script(`
 ${RELEASE_DEDUP}
 ${JOB_STATE}
-if KEYS[3] ~= '' and redis.call('EXISTS', KEYS[3]) == 1 then
+if ARGV[6] ~= '' and redis.call('EXISTS', KEYS[3] .. ARGV[6]) == 1 then
   return 0
 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
@@ -336,10 +354,10 @@ if ARGV[2] == 'failed' then
   if keep > 0 then
     redis.call('LTRIM', KEYS[2], -keep, -1)
   end
-  release_dedup(KEYS[4], ARGV[5])
-  finish(KEYS[5], KEYS[6], 'failed', ARGV[3], ARGV[6], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11])
+  release_dedup(KEYS[4], ARGV[7], ARGV[5])
+  finish(KEYS[5], ARGV[5], KEYS[6], 'failed', ARGV[3], ARGV[8], ARGV[9], ARGV[10], ARGV[11], ARGV[12])
 else
-  waiting(KEYS[5], 'pending', ARGV[3])
+  waiting(KEYS[5], ARGV[5], 'pending', ARGV[3])
 end
 return 1
 `);
@@ -559,10 +577,13 @@ export class RedisDriver implements QueueDriver {
 		}
 		return keys;
 	}
-	#dedupKey(job: JobRecord): string {
-		return job.dedup === undefined
-			? ""
-			: `${this.#prefix}dedup:${job.dedup.id}`;
+	/** Where dedup ids live; a script appends the id. */
+	#dedupPrefix(): string {
+		return `${this.#prefix}dedup:`;
+	}
+	/** The job's dedup id, empty for none — what a script appends. */
+	#dedupId(job: JobRecord): string {
+		return job.dedup?.id ?? "";
 	}
 	#processingKey(): string {
 		return `${this.#prefix}processing`;
@@ -570,8 +591,11 @@ export class RedisDriver implements QueueDriver {
 	#failedKey(): string {
 		return `${this.#prefix}failed`;
 	}
+	#leasePrefix(): string {
+		return `${this.#prefix}lease:`;
+	}
 	#leaseKey(jobId: string): string {
-		return `${this.#prefix}lease:${jobId}`;
+		return `${this.#leasePrefix()}${jobId}`;
 	}
 	#jobPrefix(): string {
 		return `${this.#prefix}job:`;
@@ -585,7 +609,7 @@ export class RedisDriver implements QueueDriver {
 
 	/**
 	 * The lookup arguments of a finishing move: kept, max age, max count, now,
-	 * hash prefix, error.
+	 * error.
 	 */
 	#retentionArgs(
 		retention: ResolvedRetention | undefined,
@@ -596,7 +620,6 @@ export class RedisDriver implements QueueDriver {
 			retention?.maxAge ?? 0,
 			retention?.maxCount ?? 0,
 			Date.now(),
-			this.#jobPrefix(),
 			error,
 		];
 	}
@@ -630,7 +653,7 @@ export class RedisDriver implements QueueDriver {
 			client,
 			PUSH,
 			[
-				this.#dedupKey(job),
+				this.#dedupPrefix(),
 				delayed ? this.#delayedOf(job) : this.#pendingOf(job),
 				this.#jobKey(job.id),
 			],
@@ -642,6 +665,7 @@ export class RedisDriver implements QueueDriver {
 				job.dedup?.ttl ?? 0,
 				job.dedup?.extend ? "1" : "0",
 				delayed ? "delayed" : "pending",
+				this.#dedupId(job),
 			],
 		);
 		return typeof holder === "string" ? holder : undefined;
@@ -652,7 +676,11 @@ export class RedisDriver implements QueueDriver {
 	): Promise<JobRecord | null> {
 		if (queues.length === 0) return null;
 		const client = await this.#client();
-		const keys = [this.#processingKey()];
+		const keys = [
+			this.#processingKey(),
+			this.#leasePrefix(),
+			this.#jobPrefix(),
+		];
 		for (const queue of queues) keys.push(...this.#levels(queue));
 		// A record that cannot run is filed and the next one taken, so a run of
 		// bad entries does not cost a full idle delay each. Bounded, so a queue
@@ -664,9 +692,7 @@ export class RedisDriver implements QueueDriver {
 					Date.now(),
 					token,
 					this.#visibilityTimeout,
-					`${this.#prefix}lease:`,
 					PRIORITY_LEVELS,
-					this.#jobPrefix(),
 				]),
 			);
 			if (reply === null) return null;
@@ -718,9 +744,9 @@ export class RedisDriver implements QueueDriver {
 					this.#leaseKey(held.id),
 					this.#processingKey(),
 					this.#failedKey(),
-					"",
-					"",
-					"",
+					this.#dedupPrefix(),
+					this.#jobPrefix(),
+					this.#historyKey("failed", DEFAULT_QUEUE),
 				],
 				[
 					held.token,
@@ -728,6 +754,9 @@ export class RedisDriver implements QueueDriver {
 					"failed",
 					record,
 					this.#maxFailedJobs,
+					// No lookup hash and no dedup id: neither can be trusted on
+					// a record the queue cannot read.
+					"",
 					"",
 					"",
 					...this.#retentionArgs(undefined, ""),
@@ -738,12 +767,21 @@ export class RedisDriver implements QueueDriver {
 		await this.#run(
 			client,
 			RECOVER,
-			[this.#processingKey(), this.#failedKey(), "", "", "", ""],
+			[
+				this.#processingKey(),
+				this.#failedKey(),
+				this.#leasePrefix(),
+				this.#dedupPrefix(),
+				this.#jobPrefix(),
+				this.#historyKey("failed", DEFAULT_QUEUE),
+			],
 			[
 				raw,
 				"failed",
 				record,
 				this.#maxFailedJobs,
+				"",
+				"",
 				"",
 				...this.#retentionArgs(undefined, ""),
 			],
@@ -876,9 +914,10 @@ export class RedisDriver implements QueueDriver {
 				this.#leaseKey(claim.id),
 				this.#processingKey(),
 				destination,
-				this.#dedupKey(job),
-				this.#jobKey(job.id),
-				finished === null ? "" : this.#historyKey(finished, queueOf(job)),
+				this.#dedupPrefix(),
+				this.#jobPrefix(),
+				// Untouched by a move that does not finish the job.
+				this.#historyKey(finished ?? "failed", queueOf(job)),
 			],
 			[
 				claim.token,
@@ -887,6 +926,7 @@ export class RedisDriver implements QueueDriver {
 				entry,
 				extra,
 				job.id,
+				this.#dedupId(job),
 				JSON.stringify(job),
 				...this.#retentionArgs(
 					finished === "completed"
@@ -906,10 +946,18 @@ export class RedisDriver implements QueueDriver {
 		}
 	}
 
-	async recoverStale(): Promise<number> {
+	/**
+	 * Move every entry whose lease ran out back to its queue, or to the failed
+	 * list once it stalled more than `maxStalledCount` times. Answers how many
+	 * went back, and the jobs this pass failed with the `E_JOB_STALLED` their
+	 * `failed()` hook receives — only the pass whose script moved an entry
+	 * reports it, so two workers sweeping at once never call one hook twice.
+	 */
+	async recoverStale(): Promise<StaleRecovery> {
 		const client = await this.#client();
 		const processing = await client.lrange(this.#processingKey(), 0, -1);
 		let recovered = 0;
+		const failed: StaleRecovery["failed"] = [];
 		for (const raw of processing) {
 			const parsed = parseJob(raw);
 			if (!parsed.ok) {
@@ -921,16 +969,18 @@ export class RedisDriver implements QueueDriver {
 					[
 						this.#processingKey(),
 						this.#failedKey(),
-						parsed.id === undefined ? "" : this.#leaseKey(parsed.id),
-						"",
-						"",
-						"",
+						this.#leasePrefix(),
+						this.#dedupPrefix(),
+						this.#jobPrefix(),
+						this.#historyKey("failed", DEFAULT_QUEUE),
 					],
 					[
 						raw,
 						"failed",
 						JSON.stringify(this.#deadLetter(raw, parsed)),
 						this.#maxFailedJobs,
+						"",
+						parsed.id ?? "",
 						"",
 						...this.#retentionArgs(undefined, ""),
 					],
@@ -946,12 +996,12 @@ export class RedisDriver implements QueueDriver {
 			job.stalledCount = stalled;
 			job.runAt = undefined;
 			const exhausted = stalled > this.#maxStalledCount;
-			if (exhausted) {
+			const stalledError = exhausted
+				? new E_JOB_STALLED([job.name, this.#maxStalledCount])
+				: undefined;
+			if (stalledError !== undefined) {
 				job.status = "failed";
-				job.error = new E_JOB_STALLED([
-					job.name,
-					this.#maxStalledCount,
-				]).message;
+				job.error = stalledError.message;
 			} else {
 				job.status = "pending";
 			}
@@ -963,9 +1013,9 @@ export class RedisDriver implements QueueDriver {
 					// Back to the queue it came from: a recovered job whose queue
 					// nobody serves would never run again.
 					exhausted ? this.#failedKey() : this.#pendingOf(job),
-					this.#leaseKey(job.id),
-					this.#dedupKey(job),
-					this.#jobKey(job.id),
+					this.#leasePrefix(),
+					this.#dedupPrefix(),
+					this.#jobPrefix(),
 					this.#historyKey("failed", queueOf(job)),
 				],
 				[
@@ -974,12 +1024,16 @@ export class RedisDriver implements QueueDriver {
 					JSON.stringify(job),
 					this.#maxFailedJobs,
 					job.id,
+					job.id,
+					this.#dedupId(job),
 					...this.#retentionArgs(job.removeOnFail, job.error ?? ""),
 				],
 			);
-			if (moved === 1 && !exhausted) recovered++;
+			if (moved !== 1) continue;
+			if (stalledError === undefined) recovered++;
+			else failed.push({ job, error: stalledError });
 		}
-		return recovered;
+		return { recovered, failed };
 	}
 
 	async failed(): Promise<JobRecord[]> {

@@ -12,7 +12,6 @@ import {
 	entriesUnder,
 	freshPrefix,
 	intercept,
-	useRedis,
 } from "../__helpers__/redis.js";
 import { scripting } from "../__helpers__/scripting.js";
 
@@ -221,8 +220,7 @@ describe("bay > RedisDriver > scripts by digest", () => {
 	});
 });
 
-describeRedis("bay > RedisDriver against a live Redis", () => {
-	const redis = useRedis();
+describeRedis("bay > RedisDriver against a live Redis", (redis) => {
 	const connection = () => redis.manager.connection("w0");
 
 	async function driverFor(
@@ -277,7 +275,7 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 		const { driver, prefix } = await driverFor("complete");
 		await driver.push(makeJob({ id: "j1" }));
 		await driver.complete(defined(await driver.pop()));
-		expect(await entriesUnder(redis.manager, prefix)).toEqual({});
+		expect(await entriesUnder(redis, prefix)).toEqual({});
 	});
 
 	it("fail moves the job to the failed list and records the error", async () => {
@@ -314,10 +312,10 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 	it("does not settle a record it never took", async () => {
 		const { driver, prefix } = await driverFor("foreign");
 		await driver.push(makeJob({ id: "j1" }));
-		const before = await entriesUnder(redis.manager, prefix);
+		const before = await entriesUnder(redis, prefix);
 		await driver.complete(makeJob({ id: "j1" }));
 		await driver.fail(makeJob({ id: "j1" }), "nope");
-		expect(await entriesUnder(redis.manager, prefix)).toEqual(before);
+		expect(await entriesUnder(redis, prefix)).toEqual(before);
 	});
 
 	it("recoverStale moves an expired job back to pending and leaves a leased one", async () => {
@@ -328,7 +326,7 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 		await driver.pop();
 		await connection().del(`${prefix}lease:a`);
 
-		expect(await driver.recoverStale()).toBe(1);
+		expect((await driver.recoverStale()).recovered).toBe(1);
 		const pending = await connection().lrange(`${prefix}pending`, 0, -1);
 		expect(pending.map((raw) => JSON.parse(raw).id)).toEqual(["a"]);
 		expect(JSON.parse(defined(pending[0])).stalledCount).toBe(1);
@@ -407,7 +405,7 @@ describeRedis("bay > RedisDriver against a live Redis", () => {
 	it("files an unreadable entry found in processing as failed too", async () => {
 		const { driver, prefix } = await driverFor("unreadable-processing");
 		await connection().rpush(`${prefix}processing`, "garbage");
-		expect(await driver.recoverStale()).toBe(0);
+		expect((await driver.recoverStale()).recovered).toBe(0);
 		expect((await driver.failed()).map((job) => job.payload)).toEqual([
 			"garbage",
 		]);

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { E_JOB_STALLED } from "../../src/errors.js";
+import { Job, type JobContext } from "../../src/Job.js";
 import {
 	type JobHandler,
 	type JobRecord,
@@ -315,6 +317,149 @@ describe("bay > QueueManager > recoverStale", () => {
 		await q.stop();
 		await run;
 		expect(driver.recoverCalls).toBe(1);
+	});
+});
+
+describe("bay > QueueManager > a job that stalled too often", () => {
+	/** A driver whose sweep filed `failed` as stalled, as the Redis one does. */
+	class StallingDriver extends CapturingDriver {
+		constructor(readonly stalled: JobRecord[]) {
+			super();
+		}
+		async recoverStale() {
+			return {
+				recovered: 3,
+				failed: this.stalled.map((job) => ({
+					job,
+					error: new E_JOB_STALLED([job.name, 1]),
+				})),
+			};
+		}
+	}
+
+	function stalledRecord(name: string): JobRecord {
+		return {
+			id: `job_${name}`,
+			name,
+			payload: { to: "a@b.c" },
+			attempts: 1,
+			maxAttempts: 3,
+			status: "failed",
+			createdAt: Date.now(),
+			stalledCount: 2,
+		};
+	}
+
+	it("calls its failed() hook with E_JOB_STALLED, payload and context set", async () => {
+		const seen: Array<{ error: Error; payload: unknown; context: JobContext }> =
+			[];
+		let executed = 0;
+		class SendEmail extends Job<{ to: string }> {
+			execute() {
+				executed++;
+			}
+			override failed(error: Error) {
+				seen.push({ error, payload: this.payload, context: this.context });
+			}
+		}
+		const q = new QueueManager(
+			new StallingDriver([stalledRecord("SendEmail")]),
+		);
+		q.registerJob(SendEmail);
+
+		expect(await q.recoverStale()).toBe(3);
+
+		expect(executed).toBe(0);
+		expect(seen).toHaveLength(1);
+		const [call] = seen;
+		expect(call?.error).toBeInstanceOf(E_JOB_STALLED);
+		expect(call?.error).toMatchObject({
+			code: "E_JOB_STALLED",
+			message: 'The job "SendEmail" stalled more than the allowed 1 time(s)',
+		});
+		expect(call?.payload).toEqual({ to: "a@b.c" });
+		expect(call?.context).toMatchObject({
+			jobId: "job_SendEmail",
+			name: "SendEmail",
+			stalledCount: 2,
+		});
+	});
+
+	it("reports a hook that throws and carries on with the next job", async () => {
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		const calls: string[] = [];
+		class Loud extends Job {
+			execute() {}
+			override failed() {
+				calls.push("Loud");
+				throw new Error("alert service down");
+			}
+		}
+		class Quiet extends Job {
+			execute() {}
+			override failed() {
+				calls.push("Quiet");
+			}
+		}
+		const q = new QueueManager(
+			new StallingDriver([stalledRecord("Loud"), stalledRecord("Quiet")]),
+		);
+		q.registerJob(Loud);
+		q.registerJob(Quiet);
+		try {
+			expect(await q.recoverStale()).toBe(3);
+			expect(calls).toEqual(["Loud", "Quiet"]);
+			expect(stderr).toHaveBeenCalledWith(
+				"QueueManager: failed() hook of 'Loud' threw: alert service down\n",
+			);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("skips a job nothing answers to, or whose class cannot be built", async () => {
+		const stderr = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		let hooks = 0;
+		class Unbuildable extends Job {
+			execute() {}
+			override failed() {
+				hooks++;
+			}
+		}
+		const q = new QueueManager(
+			new StallingDriver([
+				stalledRecord("Nobody"),
+				stalledRecord("Unbuildable"),
+			]),
+			undefined,
+			{
+				jobFactory: () => {
+					throw new Error("dependency missing");
+				},
+			},
+		);
+		q.registerJob(Unbuildable);
+		try {
+			expect(await q.recoverStale()).toBe(3);
+			expect(hooks).toBe(0);
+			expect(stderr).toHaveBeenCalledWith(
+				"QueueManager: cannot build 'Unbuildable' to report it stalled: dependency missing\n",
+			);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("has nothing to call for a registered handler", async () => {
+		const handle = vi.fn();
+		const q = new QueueManager(new StallingDriver([stalledRecord("work")]));
+		q.register("work", { handle });
+		expect(await q.recoverStale()).toBe(3);
+		expect(handle).not.toHaveBeenCalled();
 	});
 });
 

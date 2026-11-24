@@ -11,7 +11,7 @@ import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { Job, type JobContext } from "../../src/Job.js";
 import { type QueueDriver, QueueManager } from "../../src/QueueManager.js";
 import { clearQueue, setQueue } from "../../src/services/main.js";
-import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
+import { describeRedis, freshPrefix } from "../__helpers__/redis.js";
 
 async function drainAll(queue: QueueManager): Promise<number> {
 	let ran = 0;
@@ -261,8 +261,7 @@ describe("bay > getJob on the memory driver", () => {
 	lookupSuite(() => new MemoryDriver());
 });
 
-describeRedis("bay > getJob on the Redis driver", () => {
-	const redis = useRedis();
+describeRedis("bay > getJob on the Redis driver", (redis) => {
 	lookupSuite(
 		async () =>
 			new RedisDriver(await redis.client(), { prefix: freshPrefix("lookup") }),

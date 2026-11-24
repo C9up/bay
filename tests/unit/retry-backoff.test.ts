@@ -15,7 +15,7 @@ import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { Job } from "../../src/Job.js";
 import { type QueueDriver, QueueManager } from "../../src/QueueManager.js";
-import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
+import { describeRedis, freshPrefix } from "../__helpers__/redis.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -167,9 +167,7 @@ describe("bay > a retry waits for its backoff", () => {
 	});
 });
 
-describeRedis("bay > a retry waits for its backoff on Redis", () => {
-	const redis = useRedis();
-
+describeRedis("bay > a retry waits for its backoff on Redis", (redis) => {
 	it("through the delayed set", async () => {
 		const driver = new RedisDriver(await redis.client(), {
 			prefix: freshPrefix("backoff"),

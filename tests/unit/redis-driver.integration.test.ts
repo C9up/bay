@@ -12,12 +12,7 @@ import { beforeEach, expect, it } from "vitest";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import type { JobRecord } from "../../src/QueueManager.js";
 import { quasarConnection } from "../../src/quasar.js";
-import {
-	describeRedis,
-	freshPrefix,
-	useRedis,
-	WORKERS,
-} from "../__helpers__/redis.js";
+import { describeRedis, freshPrefix, WORKERS } from "../__helpers__/redis.js";
 
 function makeJob(id: string): JobRecord {
 	return {
@@ -31,9 +26,9 @@ function makeJob(id: string): JobRecord {
 	};
 }
 
-describeRedis("RedisDriver against a live Redis", () => {
+describeRedis("RedisDriver against a live Redis", (redis) => {
 	const prefix = freshPrefix("integration");
-	const { manager } = useRedis();
+	const { manager } = redis;
 
 	function driver(worker: number): RedisDriver {
 		return new RedisDriver(quasarConnection(`w${worker}`), {
@@ -44,7 +39,7 @@ describeRedis("RedisDriver against a live Redis", () => {
 
 	beforeEach(async () => {
 		const client = manager.connection("w0");
-		const keys = await client.keys(`${prefix}*`);
+		const keys = await redis.keys(`${prefix}*`);
 		if (keys.length > 0) await client.del(...keys);
 	});
 

@@ -70,6 +70,7 @@ export type {
 	JobStatus,
 	QueueDriver,
 	QueueManagerOptions,
+	StaleRecovery,
 	WorkerOptions,
 } from "./QueueManager.js";
 export {

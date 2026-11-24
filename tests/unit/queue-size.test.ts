@@ -8,7 +8,7 @@ import { MemoryDriver } from "../../src/drivers/MemoryDriver.js";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
 import { type QueueDriver, QueueManager } from "../../src/QueueManager.js";
 import { FakeQueue } from "../../src/testing/FakeQueue.js";
-import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
+import { describeRedis, freshPrefix } from "../__helpers__/redis.js";
 
 async function counts(driver: QueueDriver) {
 	const queue = new QueueManager(driver);
@@ -58,9 +58,7 @@ describe("bay > queue size", () => {
 	});
 });
 
-describeRedis("bay > queue size on Redis", () => {
-	const redis = useRedis();
-
+describeRedis("bay > queue size on Redis", (redis) => {
 	it("counts exactly like the memory driver", async () => {
 		const driver = new RedisDriver(await redis.client(), {
 			prefix: freshPrefix("size"),

@@ -4,8 +4,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/drivers/RedisDriver.js";
+import { E_JOB_STALLED } from "../../src/errors.js";
+import { Job } from "../../src/Job.js";
 import { type JobRecord, QueueManager } from "../../src/QueueManager.js";
-import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
+import { describeRedis, freshPrefix } from "../__helpers__/redis.js";
 import { scripting } from "../__helpers__/scripting.js";
 
 function makeJob(id: string): JobRecord {
@@ -20,8 +22,7 @@ function makeJob(id: string): JobRecord {
 	};
 }
 
-describeRedis("bay > stalled jobs", () => {
-	const redis = useRedis();
+describeRedis("bay > stalled jobs", (redis) => {
 	const connection = () => redis.manager.connection("w0");
 
 	async function drivers(
@@ -52,7 +53,7 @@ describeRedis("bay > stalled jobs", () => {
 				second.recoverStale(),
 			]);
 
-			expect(counts.reduce((total, n) => total + n, 0)).toBe(1);
+			expect(counts.reduce((total, n) => total + n.recovered, 0)).toBe(1);
 			expect(await connection().llen(`${prefix}pending`)).toBe(1);
 			expect(await connection().llen(`${prefix}processing`)).toBe(0);
 		});
@@ -64,13 +65,22 @@ describeRedis("bay > stalled jobs", () => {
 			await first.push(makeJob("poison"));
 
 			const delivered: string[] = [];
+			const filed: Array<{ id: string; error: Error }> = [];
 			for (let round = 0; round < 5; round++) {
 				const job = await first.pop();
 				if (job) delivered.push(job.id);
 				// The process died; the lease goes with it.
 				await connection().del(`${prefix}lease:poison`);
-				await first.recoverStale();
+				const { failed } = await first.recoverStale();
+				for (const entry of failed) {
+					filed.push({ id: entry.job.id, error: entry.error });
+				}
 			}
+
+			// The pass that filed it says so, once, with the hook's error.
+			expect(filed).toHaveLength(1);
+			expect(filed[0]?.id).toBe("poison");
+			expect(filed[0]?.error).toBeInstanceOf(E_JOB_STALLED);
 
 			// Upstream's default: reclaimed once, then failed. A crash never
 			// reaches the failure path, so `attempts` cannot bound this.
@@ -99,6 +109,39 @@ describeRedis("bay > stalled jobs", () => {
 			// One first delivery plus three reclaims.
 			expect(delivered).toBe(4);
 			expect(await first.failed()).toHaveLength(1);
+		});
+	});
+
+	describe("a job class that stalled too often", () => {
+		it("hears it through its failed() hook, once, even with two sweepers", async () => {
+			const { first, second, prefix } = await drivers("hook");
+			const hooks: Array<{ error: Error; payload: unknown }> = [];
+			class Report extends Job<{ month: string }> {
+				execute() {}
+				override failed(error: Error) {
+					hooks.push({ error, payload: this.payload });
+				}
+			}
+			const a = new QueueManager(first);
+			const b = new QueueManager(second);
+			a.registerJob(Report);
+			b.registerJob(Report);
+
+			const id = await a.dispatch(Report, { month: "2026-11" });
+			for (let round = 0; round < 2; round++) {
+				// Taken, then the worker died with the job.
+				expect((await first.pop())?.id).toBe(id);
+				await connection().del(`${prefix}lease:${id}`);
+				await Promise.all([a.recoverStale(), b.recoverStale()]);
+			}
+
+			expect(hooks).toHaveLength(1);
+			expect(hooks[0]?.error).toBeInstanceOf(E_JOB_STALLED);
+			expect(hooks[0]?.error.message).toBe(
+				'The job "Report" stalled more than the allowed 1 time(s)',
+			);
+			expect(hooks[0]?.payload).toEqual({ month: "2026-11" });
+			expect((await first.failed()).map((job) => job.id)).toEqual([id]);
 		});
 	});
 
@@ -148,7 +191,7 @@ describeRedis("bay > stalled jobs", () => {
 			await vi.waitFor(async () =>
 				expect(await connection().pttl(lease)).toBeGreaterThan(5_000),
 			);
-			const reclaimed = await second.recoverStale();
+			const { recovered: reclaimed } = await second.recoverStale();
 			release?.();
 			await processing;
 
@@ -172,7 +215,7 @@ describeRedis("bay > stalled jobs", () => {
 			// no lease back.
 			expect(vi.getTimerCount()).toBe(0);
 			await vi.advanceTimersByTimeAsync(first.renewIntervalMs * 3);
-			expect(await connection().keys(`${prefix}*`)).toEqual([]);
+			expect(await redis.keys(`${prefix}*`)).toEqual([]);
 		});
 	});
 

@@ -152,6 +152,11 @@ interface JobRunner {
 		context: JobContext,
 	): Promise<void> | void;
 	onFailed?(error: Error): Promise<void> | void;
+	/**
+	 * Give the job its payload and context without running it, for a
+	 * `failed()` hook called outside an attempt (a job that stalled too often).
+	 */
+	hydrate?(payload: unknown, context: JobContext): void;
 }
 
 /**
@@ -339,6 +344,19 @@ export interface DispatchOptions extends Omit<JobOptions, "name"> {
 	maxAttempts?: number;
 }
 
+/**
+ * What one stall-recovery pass did: upstream's `recoverStalledJobs` answer.
+ */
+export interface StaleRecovery {
+	/** Jobs moved back to their queue. */
+	recovered: number;
+	/**
+	 * Jobs that stalled more than the driver allows, already filed as failed,
+	 * each with the error its `failed()` hook receives (`E_JOB_STALLED`).
+	 */
+	failed: Array<{ job: JobRecord; error: Error }>;
+}
+
 export interface QueueDriver {
 	/**
 	 * Store a job. A driver that honours `job.dedup` answers the id (a string)
@@ -375,10 +393,14 @@ export interface QueueDriver {
 	getJob?(jobId: string): Promise<JobLookup | null>;
 	/**
 	 * Optional crash recovery: move jobs orphaned in the driver's 'processing'
-	 * state (expired visibility lease) back to pending, returning the count
-	 * recovered. In-memory drivers omit this — their jobs don't survive a crash.
+	 * state (expired visibility lease) back to pending. In-memory drivers omit
+	 * this — their jobs don't survive a crash.
+	 *
+	 * A driver that bounds the stalls answers a {@link StaleRecovery}, so the
+	 * manager can call the `failed()` hook of each job it filed as failed; a
+	 * driver that never fails a job for stalling may answer the count alone.
 	 */
-	recoverStale?(): Promise<number>;
+	recoverStale?(): Promise<number | StaleRecovery>;
 	/**
 	 * Optional lease renewal: tell the driver this job is still being worked on,
 	 * answering `false` when the claim is gone (already recovered, or now held
@@ -838,26 +860,30 @@ export class QueueManager {
 				`The job factory built ${JobConstructor.name} into something that is not an instance of it`,
 			]);
 		}
+		// `payload`, `context` and `signal` are declared readonly on the class
+		// so a handler cannot rewrite them; they are assigned once, here.
+		const hydrate = (payload: unknown, context: JobContext): void => {
+			Object.defineProperty(instance, "payload", {
+				value: payload,
+				configurable: true,
+				enumerable: true,
+			});
+			Object.defineProperty(instance, "context", {
+				value: context,
+				configurable: true,
+			});
+		};
 		return {
 			run: (payload, signal, context) => {
-				// `payload` and `signal` are declared readonly on the class so a
-				// handler cannot rewrite them; they are assigned once, here.
-				Object.defineProperty(instance, "payload", {
-					value: payload,
-					configurable: true,
-					enumerable: true,
-				});
+				hydrate(payload, context);
 				Object.defineProperty(instance, "signal", {
 					value: signal,
-					configurable: true,
-				});
-				Object.defineProperty(instance, "context", {
-					value: context,
 					configurable: true,
 				});
 				return instance.execute();
 			},
 			onFailed: instance.failed?.bind(instance),
+			hydrate,
 		};
 	}
 
@@ -1070,7 +1096,47 @@ export class QueueManager {
 	 * Called automatically by work(); also safe to schedule manually.
 	 */
 	async recoverStale(): Promise<number> {
-		return (await this.#driver.recoverStale?.()) ?? 0;
+		const outcome = await this.#driver.recoverStale?.();
+		if (outcome === undefined) return 0;
+		if (typeof outcome === "number") return outcome;
+		for (const { job, error } of outcome.failed) {
+			await this.#failStalled(job, error);
+		}
+		return outcome.recovered;
+	}
+
+	/**
+	 * Tell a job that stalled too often that it failed — upstream's
+	 * `failStalled`. The driver has already filed it; what is left is its
+	 * `failed()` hook, which receives `E_JOB_STALLED` like any final failure
+	 * and is reported and swallowed when it throws. Nothing runs the handler.
+	 * A job nothing answers to, or whose class cannot be built, has no hook to
+	 * call.
+	 */
+	async #failStalled(job: JobRecord, error: Error): Promise<void> {
+		const target = this.#lookup(job.name);
+		if (target === undefined) return;
+		let runner: JobRunner;
+		try {
+			runner = await this.#build(target);
+		} catch (buildErr) {
+			process.stderr.write(
+				`QueueManager: cannot build '${job.name}' to report it stalled: ${
+					buildErr instanceof Error ? buildErr.message : String(buildErr)
+				}\n`,
+			);
+			return;
+		}
+		runner.hydrate?.(job.payload, contextOf(job));
+		try {
+			await runner.onFailed?.(error);
+		} catch (hookErr) {
+			process.stderr.write(
+				`QueueManager: failed() hook of '${job.name}' threw: ${
+					hookErr instanceof Error ? hookErr.message : String(hookErr)
+				}\n`,
+			);
+		}
 	}
 
 	/** Await every in-flight attempt, if any. */

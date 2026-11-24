@@ -9,7 +9,7 @@ import {
 	RedisDriver,
 } from "../../src/drivers/RedisDriver.js";
 import type { JobRecord } from "../../src/QueueManager.js";
-import { describeRedis, freshPrefix, useRedis } from "../__helpers__/redis.js";
+import { describeRedis, freshPrefix } from "../__helpers__/redis.js";
 import { scripting } from "../__helpers__/scripting.js";
 
 const inert = (): RedisClient => ({
@@ -59,9 +59,7 @@ describe("bay > drivers.redis() forwards the driver's options", () => {
 	});
 });
 
-describeRedis("bay > drivers.redis() options take effect", () => {
-	const redis = useRedis();
-
+describeRedis("bay > drivers.redis() options take effect", (redis) => {
 	it("trims the failed list to maxFailedJobs", async () => {
 		const driver = drivers.redis({
 			connection: await redis.client(),

@@ -16,7 +16,6 @@ import {
 	entriesUnder,
 	freshPrefix,
 	intercept,
-	useRedis,
 	whereIs,
 } from "../__helpers__/redis.js";
 
@@ -58,9 +57,7 @@ function flaky(
 	};
 }
 
-describeRedis("bay > a dropped connection never loses the job", () => {
-	const redis = useRedis();
-
+describeRedis("bay > a dropped connection never loses the job", (redis) => {
 	for (const mode of ["before", "after"] as const) {
 		it(`keeps a retried job reachable (reply lost ${mode} the server ran it)`, async () => {
 			const prefix = freshPrefix("retry");
@@ -77,7 +74,7 @@ describeRedis("bay > a dropped connection never loses the job", () => {
 
 			await expect(queue.processOne()).rejects.toThrow(/ECONNRESET/);
 
-			expect(await whereIs(redis.manager, prefix, id)).not.toEqual([]);
+			expect(await whereIs(redis, prefix, id)).not.toEqual([]);
 		});
 
 		it(`keeps a finally failed job reachable (reply lost ${mode})`, async () => {
@@ -95,7 +92,7 @@ describeRedis("bay > a dropped connection never loses the job", () => {
 
 			await expect(queue.processOne()).rejects.toThrow(/ECONNRESET/);
 
-			expect(await whereIs(redis.manager, prefix, id)).not.toEqual([]);
+			expect(await whereIs(redis, prefix, id)).not.toEqual([]);
 		});
 
 		it(`keeps a delayed job reachable while it is promoted (reply lost ${mode})`, async () => {
@@ -110,7 +107,7 @@ describeRedis("bay > a dropped connection never loses the job", () => {
 			arm();
 			await expect(queue.processOne()).rejects.toThrow(/ECONNRESET/);
 
-			expect(await whereIs(redis.manager, prefix, id)).not.toEqual([]);
+			expect(await whereIs(redis, prefix, id)).not.toEqual([]);
 		});
 	}
 
@@ -131,53 +128,52 @@ describeRedis("bay > a dropped connection never loses the job", () => {
 		// The worker's lease running out, without waiting for it.
 		await redis.manager.connection("w0").del(`${prefix}lease:${id}`);
 
-		expect(await driver.recoverStale()).toBe(1);
-		expect(await whereIs(redis.manager, prefix, id)).toEqual(["pending"]);
+		expect((await driver.recoverStale()).recovered).toBe(1);
+		expect(await whereIs(redis, prefix, id)).toEqual(["pending"]);
 	});
 });
 
-describeRedis("bay > a worker whose lease lapsed cannot settle the job", () => {
-	const redis = useRedis();
+describeRedis(
+	"bay > a worker whose lease lapsed cannot settle the job",
+	(redis) => {
+		for (const settle of ["complete", "fail", "retry"] as const) {
+			it(`${settle}() leaves the new owner's entry and lease alone`, async () => {
+				const prefix = freshPrefix(`late-${settle}`);
+				// Two stalls in this story, so the bound must allow both.
+				const options = { prefix, maxStalledCount: 2 };
+				const a = new RedisDriver(await redis.client(0), options);
+				const b = new RedisDriver(await redis.client(1), options);
+				const connection = redis.manager.connection("w0");
 
-	for (const settle of ["complete", "fail", "retry"] as const) {
-		it(`${settle}() leaves the new owner's entry and lease alone`, async () => {
-			const prefix = freshPrefix(`late-${settle}`);
-			// Two stalls in this story, so the bound must allow both.
-			const options = { prefix, maxStalledCount: 2 };
-			const a = new RedisDriver(await redis.client(0), options);
-			const b = new RedisDriver(await redis.client(1), options);
-			const connection = redis.manager.connection("w0");
+				await a.push(makeJob("j1"));
+				const jobA = await a.pop();
+				if (!jobA) throw new Error("expected a job");
 
-			await a.push(makeJob("j1"));
-			const jobA = await a.pop();
-			if (!jobA) throw new Error("expected a job");
+				// A's lease lapses; B reclaims the job and takes it.
+				await connection.del(`${prefix}lease:j1`);
+				expect((await b.recoverStale()).recovered).toBe(1);
+				const jobB = await b.pop();
+				expect(jobB?.id).toBe("j1");
+				const before = await entriesUnder(redis, prefix);
 
-			// A's lease lapses; B reclaims the job and takes it.
-			await connection.del(`${prefix}lease:j1`);
-			expect(await b.recoverStale()).toBe(1);
-			const jobB = await b.pop();
-			expect(jobB?.id).toBe("j1");
-			const before = await entriesUnder(redis.manager, prefix);
+				jobA.attempts += 1;
+				if (settle === "complete") await a.complete(jobA);
+				else if (settle === "fail") await a.fail(jobA, "late");
+				else await a.retry(jobA);
 
-			jobA.attempts += 1;
-			if (settle === "complete") await a.complete(jobA);
-			else if (settle === "fail") await a.fail(jobA, "late");
-			else await a.retry(jobA);
+				// Nothing A did reached B's claim, and nothing was re-queued.
+				expect(await entriesUnder(redis, prefix)).toEqual(before);
 
-			// Nothing A did reached B's claim, and nothing was re-queued.
-			expect(await entriesUnder(redis.manager, prefix)).toEqual(before);
+				// B crashes: its job is still recoverable.
+				await connection.del(`${prefix}lease:j1`);
+				expect((await b.recoverStale()).recovered).toBe(1);
+				expect(await whereIs(redis, prefix, "j1")).toEqual(["pending"]);
+			});
+		}
+	},
+);
 
-			// B crashes: its job is still recoverable.
-			await connection.del(`${prefix}lease:j1`);
-			expect(await b.recoverStale()).toBe(1);
-			expect(await whereIs(redis.manager, prefix, "j1")).toEqual(["pending"]);
-		});
-	}
-});
-
-describeRedis("bay > taking and renewing a lease is one step", () => {
-	const redis = useRedis();
-
+describeRedis("bay > taking and renewing a lease is one step", (redis) => {
 	it("a recovery pass running while a job is taken does not hand it to a second worker", async () => {
 		const prefix = freshPrefix("acquire");
 		let release: () => void = () => {};
@@ -202,7 +198,7 @@ describeRedis("bay > taking and renewing a lease is one step", () => {
 
 		const popping = a.pop();
 		await Promise.race([pausedAt, popping]);
-		const recovered = await b.recoverStale();
+		const { recovered } = await b.recoverStale();
 		const second = await b.pop();
 		release();
 		const first = await popping;
@@ -242,7 +238,7 @@ describeRedis("bay > taking and renewing a lease is one step", () => {
 		await Promise.race([pausedAt, renewing]);
 		// Meanwhile A's lease lapses and B takes the job.
 		await connection.del(`${prefix}lease:j1`);
-		expect(await b.recoverStale()).toBe(1);
+		expect((await b.recoverStale()).recovered).toBe(1);
 		const jobB = await b.pop();
 		if (!jobB) throw new Error("expected B to take the job");
 		const leaseOfB = await connection.get(`${prefix}lease:j1`);
